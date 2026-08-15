@@ -178,10 +178,29 @@ export interface BridgeWorkspaceRegistry {
   readonly archivedSessionIds?: readonly string[]
 }
 
+/** Exact-route reasoning metadata (mirror of LlmResolvedModelInfo.reasoning). */
+export interface BridgeReasoningInfo {
+  /** Supported efforts in adapter-preferred display order. */
+  efforts: readonly { id: string; name: string; description?: string }[]
+  /** Adapter-configured default materialized when callers omit an effort. */
+  defaultEffort?: string
+}
+
+/** Exact-route model metadata resolved by its owning adapter (mirror of LlmResolvedModelInfo). */
+export interface BridgeLlmModelInfo {
+  provider: string
+  id: string
+  name: string
+  /** Adapter-owned selectable reasoning levels when exposed; absence = no reasoning capability. */
+  reasoning?: BridgeReasoningInfo
+}
+
 /** LLM route directory (mirror of the llm service catalog reads /model uses). */
 export interface BridgeLlm {
   listProviders(): { id: string; name: string }[]
   listModels(provider: string): Promise<readonly { id: string; name: string }[]>
+  /** Exact-route metadata incl. adapter-declared reasoning efforts (mirror of llm.resolveModelInfo). */
+  resolveModelInfo?(provider: string, model: string, signal?: AbortSignal): Promise<BridgeLlmModelInfo>
 }
 
 /** Per-chat model preference set by /model; applied on the next turn. */

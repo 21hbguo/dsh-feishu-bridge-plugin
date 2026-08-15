@@ -19,6 +19,7 @@ import z from 'schemastery'
 import { createBatcher } from './batching.js'
 import { registerApproval } from './approval.js'
 import { registerCommands, renderStatus, type CommandRuntime } from './commands.js'
+import { installEffortPref } from './effort.js'
 import { registerQuestions } from './questions.js'
 import { buildChannel } from './lark.js'
 import { beginSetupFlow, loadCredentials, saveCredentials, setupErrorMessage, type SetupFlow } from './setup.js'
@@ -255,6 +256,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   const chatWorkspaces = new Map(Object.entries(state.chatWorkspaces))
   /** Per-chat current-session override: a web session (session-<uuid>) resumed into the chat. */
   const chatSessionOverride = new Map(Object.entries(state.chatSessionOverride))
+  /** Per-chat thinking-effort preference set by /effort; applied on the next turn (persisted). */
+  const chatEffortPrefs = new Map(Object.entries(state.chatEffortPrefs))
 
   /** Stable base epoch (web-mode semantics: session ids survive restarts). */
   const EPOCH = '0'
@@ -270,6 +273,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     state.chatSessionList = Object.fromEntries(chatSessionList)
     state.chatWorkspaces = Object.fromEntries(chatWorkspaces)
     state.chatSessionOverride = Object.fromEntries(chatSessionOverride)
+    state.chatEffortPrefs = Object.fromEntries(chatEffortPrefs)
     saveState(state)
   }
 
@@ -371,6 +375,11 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
         const { agent } = await agents.resume({
           resumeSessionId: sessionId,
           ...(agentOptions === undefined ? {} : { agentOptions }),
+          // Effort preference rides an agent-scoped agent/request waterfall
+          // (AgentOptions has no reasoningEffort field — see src/effort.ts),
+          // registered at creation/resume time exactly like the web GUI's
+          // model-selection setup; takes effect on the next turn.
+          setup: (agentCtx) => { installEffortPref(agentCtx, () => chatEffortPrefs.get(chatId)) },
         })
         // Let the loop reach quiescence before the first followup (headless pattern).
         await agent.whenIdle()
@@ -391,6 +400,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
       sessionId,
       meta: { cwd, agentPreset: presetId },
       ...(agentOptions === undefined ? {} : { agentOptions }),
+      setup: (agentCtx) => { installEffortPref(agentCtx, () => chatEffortPrefs.get(chatId)) },
     })
     if (workspace !== undefined) {
       try { await workspace.attachSession(sessionId) } catch (error) {
@@ -972,6 +982,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     chatStreamPrefs,
     chatYoloPrefs,
     chatModelPrefs,
+    chatEffortPrefs,
     chatTranscript,
     log,
     cmdReply,

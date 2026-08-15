@@ -1,6 +1,6 @@
 /**
- * Durable per-chat state: chatEpochs / chatSessionList / chatWorkspaces
- * persisted to ~/.dsh/dsh-feishu-bridge/state.json.
+ * Durable per-chat state: chatEpochs / chatSessionList / chatWorkspaces /
+ * chatEffortPrefs persisted to ~/.dsh/dsh-feishu-bridge/state.json.
  */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -15,6 +15,8 @@ export interface BridgeState {
   chatWorkspaces: Record<string, string>
   /** Per-chat current-session override: a web session (session-<uuid>) resumed into the chat. */
   chatSessionOverride: Record<string, string>
+  /** Per-chat thinking-effort preference set by /effort; applied on the next turn (survives restarts). */
+  chatEffortPrefs: Record<string, string>
 }
 
 /** Load the state file; any failure yields the empty default. */
@@ -26,9 +28,10 @@ export function loadState(): BridgeState {
       chatSessionList: parsed.chatSessionList ?? {},
       chatWorkspaces: parsed.chatWorkspaces ?? {},
       chatSessionOverride: parsed.chatSessionOverride ?? {},
+      chatEffortPrefs: parsed.chatEffortPrefs ?? {},
     }
   } catch {
-    return { chatEpochs: {}, chatSessionList: {}, chatWorkspaces: {}, chatSessionOverride: {} }
+    return { chatEpochs: {}, chatSessionList: {}, chatWorkspaces: {}, chatSessionOverride: {}, chatEffortPrefs: {} }
   }
 }
 
