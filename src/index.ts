@@ -34,8 +34,10 @@ import type {
   BridgeWorkspaceRegistry,
 } from './types.js'
 
-/** Source tag stamped on every user message the bridge injects. */
-const PLUGIN_SOURCE = 'dsh-feishu-bridge'
+// Injected user messages keep source.kind='user' (the old bridge's
+// session.prompt RPC did the same): the title / lastPromptAt systems only
+// treat kind='user' as human input, so kind='plugin' left every Feishu
+// session untitled (web shows the cwd basename) and never-prompted.
 
 export const name = '@dsh-external/dsh-feishu-bridge'
 export const inject = ['agents']
@@ -409,12 +411,12 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
       if (mode === 'steer') {
         agent.steer(createUserMessage({
           content: [{ type: 'text', text }],
-          source: { kind: 'plugin', plugin: PLUGIN_SOURCE },
+          source: { kind: 'user' },
         }))
       } else {
         agent.followup(createUserMessage({
           content: [{ type: 'text', text }],
-          source: { kind: 'plugin', plugin: PLUGIN_SOURCE },
+          source: { kind: 'user' },
         }))
       }
       await done
