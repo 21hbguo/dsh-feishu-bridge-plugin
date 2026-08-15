@@ -681,15 +681,50 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     return chatPending.get(chatId) ?? 0
   }
 
-  /** Current model label from the live agent (no session.models / workspace API). */
-  function modelLabel(chatId: string): string {
-    const agent = agents?.get(sessionIdForChat(chatId))
-    const options = agent?.options
-    if (options === undefined) return '—'
-    const model = options.model
-    if (model === undefined || model === '') return '—'
-    const provider = options.provider ?? ''
-    return provider === '' ? model : `${provider} / ${model}`
+  /** Format a provider/model pair into a label (empty provider collapses). */
+  function formatModel(provider: string | undefined, model: string): string {
+    return provider !== undefined && provider !== '' ? `${provider} / ${model}` : model
+  }
+
+  /**
+   * Current model label of the chat's session. Precedence mirrors the web
+   * GUI's session.models: the live agent's last logged request config (the
+   * authoritative route), then its creation-time options, then the cold
+   * session's persisted request/header log (so /status works after a restart
+   * or reload when no agent is live), then the deployment default — '—' only
+   * when nothing is known.
+   */
+  async function modelLabel(chatId: string): Promise<string> {
+    const sessionId = sessionIdForChat(chatId)
+    const agent = agents?.get(sessionId)
+    if (agent !== undefined) {
+      const config = agent.session.requestHeader?.()?.config
+      if (config !== undefined && config.model !== undefined && config.model !== '') {
+        return formatModel(config.provider, config.model)
+      }
+      const options = agent.options
+      if (options !== undefined && options.model !== undefined && options.model !== '') {
+        return formatModel(options.provider, options.model)
+      }
+    }
+    const persistence = ctx.get('sessionPersistence') as BridgeSessionPersistence | undefined
+    if (persistence !== undefined) {
+      try {
+        const { events } = await persistence.inspect(sessionId)
+        for (let i = events.length - 1; i >= 0; i--) {
+          const ev = events[i]
+          if (ev.type !== 'request/header') continue
+          const header = (ev.data as { header?: { config?: { provider?: string; model?: string } } }).header
+          if (header?.config?.model !== undefined && header.config.model !== '') {
+            return formatModel(header.config.provider, header.config.model)
+          }
+        }
+      } catch { /* persistence read failed — fall through */ }
+    }
+    const dm = ctx.get('agentDefaultModel') as { currentSelection(): BridgeModelPreference } | undefined
+    const sel = dm?.currentSelection()
+    if (sel !== undefined && sel.provider !== '' && sel.model !== '') return `${sel.provider} / ${sel.model}`
+    return '—'
   }
 
   // ------------------------------------------------------------ commands (M17 in src/commands.ts)

@@ -67,6 +67,8 @@ export interface BridgeSession {
   seq?: number
   header?: BridgeSessionHeader
   events?: readonly BridgeLogEvent[]
+  /** Last logged request config (provider/model the session actually ran with; same source session.models reads). */
+  requestHeader?(): { config?: { provider?: string; model?: string } } | undefined
 }
 
 /** Live session store (mirror of dsh-session SessionStore). */

@@ -63,7 +63,8 @@ export interface CommandRuntime {
   appendEpoch(chatId: string, epoch: string): void
   persist(): void
   queueDepth(chatId: string): number
-  modelLabel(chatId: string): string
+  /** Current model label (durable: live agent request config → options → persisted log → default). */
+  modelLabel(chatId: string): Promise<string>
   restartChannel(): Promise<void>
 }
 
@@ -134,9 +135,10 @@ function workspaceForSession(runtime: CommandRuntime, sessionId: string): Bridge
   }
 }
 
-/** Latest assistant answer text of a session log (excerpt source for /resume). */
-function latestAnswer(events: readonly BridgeLogEvent[]): string {
-  for (let i = events.length - 1; i >= 0; i--) {
+/** Up to `max` latest non-empty assistant answer texts of a session log (excerpt source for /resume and /status). */
+function latestAssistantAnswers(events: readonly BridgeLogEvent[], max: number): string[] {
+  const out: string[] = []
+  for (let i = events.length - 1; i >= 0 && out.length < max; i--) {
     const ev = events[i]
     if (ev.type !== 'assistant/message') continue
     const content = ev.data?.message?.content ?? []
@@ -146,9 +148,14 @@ function latestAnswer(events: readonly BridgeLogEvent[]): string {
       .join('')
       .replace(/\s+/g, ' ')
       .trim()
-    if (text !== '') return text
+    if (text !== '') out.push(text)
   }
-  return ''
+  return out
+}
+
+/** Latest assistant answer text of a session log (excerpt source for /resume). */
+function latestAnswer(events: readonly BridgeLogEvent[]): string {
+  return latestAssistantAnswers(events, 1)[0] ?? ''
 }
 
 /** One /resume candidate row. */
@@ -274,16 +281,31 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
       async run(msg) {
         const lines = [
           `🤖 bot: ${runtime.channel.botIdentity?.name ?? runtime.appId}`,
-          `🧩 模型: ${runtime.modelLabel(msg.chatId)}`,
+          `🧩 模型: ${await runtime.modelLabel(msg.chatId)}`,
           `💬 会话: ${runtime.sessionIdForChat(msg.chatId)}`,
+          `📁 工作区: ${workspaceLabel(runtime, msg.chatId)}`,
           `🔄 流式: ${(runtime.chatStreamPrefs.get(msg.chatId) ?? runtime.streamDefault) ? 'on' : 'off'}`,
           `⏳ 队列深度: ${runtime.queueDepth(msg.chatId)}`,
           `🕐 运行时长: ${Math.round((Date.now() - runtime.STARTED_AT) / 60_000)} 分钟`,
         ]
         const currentEpoch = runtime.epochFor(msg.chatId)
-        const answers = (runtime.chatTranscript.get(msg.chatId) ?? [])
+        let answers = (runtime.chatTranscript.get(msg.chatId) ?? [])
           .filter((e) => e.role === 'assistant' && e.epoch === currentEpoch)
           .slice(-5)
+        if (answers.length === 0) {
+          // The in-memory transcript resets on plugin reload/restart; fall
+          // back to the current session's persisted log so excerpts survive
+          // restarts and /resume switches (bridge.mjs /resume pattern).
+          const sessionId = runtime.sessionIdForChat(msg.chatId)
+          const persistence = runtime.ctx.get('sessionPersistence') as BridgeSessionPersistence | undefined
+          if (persistence !== undefined) {
+            try {
+              const { events } = await persistence.inspect(sessionId)
+              answers = latestAssistantAnswers(events ?? [], 5)
+                .map((text) => ({ role: 'assistant' as const, text, epoch: currentEpoch }))
+            } catch { /* keep empty */ }
+          }
+        }
         if (answers.length > 0) {
           lines.push('', '📜 当前会话最近回答（各取第一句）：')
           answers.forEach((a, i) => {
