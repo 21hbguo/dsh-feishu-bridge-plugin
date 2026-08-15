@@ -4,7 +4,7 @@
 
 ![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)
 ![Platform](https://img.shields.io/badge/platform-DeepSeek%20Harness%20(DSH)-4B32C3)
-![Version](https://img.shields.io/badge/version-0.0.1-brightgreen)
+![Version](https://img.shields.io/badge/version-0.0.2-brightgreen)
 ![Language](https://img.shields.io/badge/language-TypeScript-3178C6)
 ![Messaging](https://img.shields.io/badge/feishu-lark-3370FF)
 
@@ -17,7 +17,9 @@ DSH（DeepSeek Harness）的进程内 Cordis 插件：飞书 IM 收发消息，�
 - 🔧 **工具调用进度**：agent 调用工具时卡片实时显示「🔧 正在调用工具：xxx…」，多步回合不再干等。
 - 🎯 **问答卡片**：agent 的 `ask_user_question` 以交互卡片呈现——按钮单选、勾选多选、聊天自由文本作答，点按即答。
 - 🛡️ **工具审批卡片**：agent 请求工具时推送「✅ 允许一次 / 🚫 拒绝」卡片，决策在飞书内完成；10 分钟未响应自动过期撤卡。
-- ⌨️ **斜杠命令**：15 个命令覆盖模型切换、工作区管理、会话恢复、流式开关、免审批模式等（见下方命令表）。
+- ⚡ **扫码一键配置**：装好插件后发 `/setup`（飞书内）或调用 `feishu_setup` 工具（DSH 内），扫码即自动完成「创建应用 + 获取凭据 + 重连飞书」，免去手动开放平台配置。
+- 🧠 **思考强度调节**：`/effort` 查看当前模型支持的思考档位，`/effort <档位>` 切换，下一回合生效、偏好持久化。
+- ⌨️ **斜杠命令**：17 个命令覆盖模型切换、思考强度、工作区管理、会话恢复、流式开关、免审批模式、扫码配置等（见下方命令表）。
 - 🔀 **每会话串行队列 + 插队**：同一聊天内消息按序处理；新消息可打断运行中的慢回合（阈值可配），也可强制排队。
 - 🐕 **看门狗**：单回合超过时限自动取消该回合并回复错误卡片，**绝不退出进程**。
 - 📦 **消息突发批处理**：短窗口内连发的普通消息合并为一次进入 DSH，省调用、省 token。
@@ -89,7 +91,7 @@ flowchart LR
 
 ## 🚀 快速开始
 
-从零到用上大约 10 分钟：先在飞书开放平台配好应用，再把插件装进 DSH，最后在飞书里与机器人对话。
+从零到用上大约 10 分钟：把插件装进 DSH（方式 A / B / C 任选），扫码一键配置（或手动）拿到应用与凭据，最后在飞书里与机器人对话。
 
 ### 前提
 
@@ -97,9 +99,26 @@ flowchart LR
 - 本插件 `peerDependencies` 依赖 DSH 内部包（`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-tools`，不发布于公开 npm）以及 `cordis`、`schemastery`，**必须运行在 DSH 进程内**，无法独立安装或独立部署。
 - 一个可登录[飞书开放平台](https://open.feishu.cn/)的账号。
 
-### 第一步：飞书开放平台配置
+### 第一步：获取飞书应用
 
-本插件使用**长连接模式**与飞书通信：插件主动发起 WebSocket 连接收发消息，**不需要公网回调地址，也不需要配置任何 webhook**。只需按下面步骤把应用信息准备好：
+本插件使用**长连接模式**与飞书通信：插件主动发起 WebSocket 连接收发消息，**不需要公网回调地址，也不需要配置任何 webhook**。飞书应用有两种获取方式，推荐扫码一键配置。
+
+#### ✅ 首选：扫码一键配置
+
+装好插件后（方式 A / B / C 任一），无需手动去开放平台创建应用：
+
+1. **发起配置**（二选一）：
+   - DSH 内：让 DSH 调用 `feishu_setup` 工具（如让 DSH 执行「feishu_setup」），工具返回授权链接（含过期时间）并阻塞等待结果；
+   - 飞书内：给机器人发 `/setup`（需已有凭据连接、桥正常运行），返回同样的授权链接。
+2. 打开链接，用飞书 App 扫码确认。应用名预填为「{user} 的 DSH 飞书桥」，权限预填 `im:message` / `im:message:send_as_bot`、消息事件与卡片回调。
+3. 授权完成后插件自动获取 App ID / Secret，写入 `~/.dsh/dsh-feishu-bridge/credentials.json`（权限 0600），并自动重连飞书（等价热重载：内存态偏好重置，持久化状态保留），无需重启 DSH。
+
+> ⚠️ 平台灰度可能忽略预填的权限：若扫码授权成功但机器人不回复，按下方排错表到开发者后台补开权限并重新发布版本。
+> ⚠️ 每次 `/setup` / `feishu_setup` 都会**创建新应用**（createOnly 设计），重复执行会累积多个应用；介意可在开发者后台删除旧应用。
+
+#### 进阶：手动创建飞书应用（可选）
+
+不想扫码时，也可以手动把应用信息准备好：
 
 1. 打开[飞书开放平台](https://open.feishu.cn/) → 进入「开发者后台」→ 点击**创建企业自建应用**，填写名称与描述后创建。
 2. 在应用详情页的「添加应用能力」中启用**机器人**。
@@ -110,7 +129,9 @@ flowchart LR
 5. 在「版本管理与发布」中**创建版本并发布**，等待审核通过后应用才真正生效。⚠️ 大量「机器人不回复」的案例都是只保存了配置、忘了发布版本。
 6. 在「凭证与基础信息」中记下 **App ID**（形如 `cli_xxxxxxxx`）与 **App Secret**，第三步会用到。
 
-### 第二步：安装插件（两种方式二选一）
+### 第二步：安装插件（三种方式任选其一）
+
+方式 A：标准装配（无注入器）；方式 B：注入器一键安装（已有 dsh-super-injector）；方式 C：命令行一键安装（推荐给熟悉命令行的用户）。三种方式任选其一即可。
 
 #### 方式 C：命令行一键安装（推荐给熟悉命令行的用户）
 
@@ -136,10 +157,10 @@ bash install.sh --profile my-profile --dir ~/dsh-plugins/dsh-feishu-bridge
 bash install.sh --help    # 查看全部参数与示例
 ```
 
-只下载不安装（把最新 tgz 下载到当前目录）：
+只下载不安装（把最新 tgz 下载到当前目录；资产名以 Release 页为准）：
 
 ```bash
-curl -fsSL -O https://github.com/21hbguo/dsh-feishu-bridge-plugin/releases/latest/download/dsh-external-dsh-feishu-bridge-0.0.1.tgz
+curl -fsSL -O https://github.com/21hbguo/dsh-feishu-bridge-plugin/releases/latest/download/dsh-external-dsh-feishu-bridge-0.0.2.tgz
 ```
 
 脚本自动完成下载 / 解压 / 装配 / 建软链，完成后**完全重启 DSH** 即生效；想手动控制每一步，参考方式 A。
@@ -148,11 +169,11 @@ curl -fsSL -O https://github.com/21hbguo/dsh-feishu-bridge-plugin/releases/lates
 
 不需要任何注入器或开发工具，手动装配 4 步：
 
-1. **下载并解压**：在 [GitHub Releases](https://github.com/21hbguo/dsh-feishu-bridge-plugin/releases) 下载最新 `.tgz` 包（如 `dsh-external-dsh-feishu-bridge-0.0.1.tgz`），解压到固定目录（示例 `~/dsh-plugins/dsh-feishu-bridge`）：
+1. **下载并解压**：在 [GitHub Releases](https://github.com/21hbguo/dsh-feishu-bridge-plugin/releases) 下载最新 `.tgz` 包（如 `dsh-external-dsh-feishu-bridge-0.0.2.tgz`，资产名以 Release 页为准），解压到固定目录（示例 `~/dsh-plugins/dsh-feishu-bridge`）：
 
    ```bash
    mkdir -p ~/dsh-plugins/dsh-feishu-bridge
-   tar -xzf dsh-external-dsh-feishu-bridge-0.0.1.tgz -C ~/dsh-plugins/dsh-feishu-bridge --strip-components=1
+   tar -xzf dsh-external-dsh-feishu-bridge-0.0.2.tgz -C ~/dsh-plugins/dsh-feishu-bridge --strip-components=1
    ```
 
 2. **编辑 profile 配置**：打开 `~/.dsh/profiles/<profile>/package.json`（`<profile>` 为你的 profile 名，如 `web`），把插件加入依赖与装配清单：
@@ -208,7 +229,7 @@ curl -fsSL -O https://github.com/21hbguo/dsh-feishu-bridge-plugin/releases/lates
 
 ### 第三步：配置凭据（二选一）
 
-使用第一步第 6 点拿到的 App ID / App Secret，环境变量或插件 Config 二选一（**Config 优先**）：
+两种方式二选一：**一键扫码（推荐）** 见第一步——扫码完成后插件自动把凭据写入 `~/.dsh/dsh-feishu-bridge/credentials.json`（权限 0600），无需手动配置；或手动用环境变量 / 插件 Config 配置：
 
 **方式 1：环境变量** —— 在启动 DSH 的终端（或启动脚本）中导出：
 
@@ -221,10 +242,10 @@ export FEISHU_APP_SECRET="xxxxxxxxxxxxxxxx"
 
 | 字段 | 说明 |
 | --- | --- |
-| `feishuAppId` | 飞书应用 App ID（未填时回退 `FEISHU_APP_ID`） |
-| `feishuAppSecret` | 飞书应用 App Secret（未填时回退 `FEISHU_APP_SECRET`） |
+| `feishuAppId` | 飞书应用 App ID（未填时回退 `FEISHU_APP_ID`，再回退扫码凭据文件） |
+| `feishuAppSecret` | 飞书应用 App Secret（未填时回退 `FEISHU_APP_SECRET`，再回退扫码凭据文件） |
 
-两者都配置时 Config 生效；都未配置时插件启动会报缺凭据错误。
+凭据优先级：**Config > 环境变量 > 扫码凭据文件**；三种来源都缺失时插件启动才报缺凭据错误。
 
 ### 第四步：验证
 
@@ -243,13 +264,15 @@ export FEISHU_APP_SECRET="xxxxxxxxxxxxxxxx"
 | 启动报缺凭据 | App ID / App Secret 未配置或填错 | 核对环境变量 / Config 与开放平台「凭证与基础信息」是否一致 |
 | 插件未生效（无日志、无机器人） | profile 装配 / 软链 / 重启未完成 | 核对 `dependencies` 与 `bundles` 是否包含插件、`node_modules` 软链是否指向解压目录、是否完全重启 DSH |
 | 回复不是逐字刷新 | 流式开关被关闭 | 私聊发送 `/stream on` 开启流式回复 |
+| 扫码授权成功但机器人不回复 | 平台灰度未预填权限 | 到开发者后台补开机器人能力与 `im:message` / `im:message:send_as_bot` 权限，并**重新创建版本并发布** |
+| `/setup` 多次执行累积多个应用 | 属预期行为：每次扫码都创建新应用（createOnly 设计） | 介意可在开发者后台删除旧应用 |
 
 ## ⚙️ 配置项
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `feishuAppId` | string | `''`（回退 `FEISHU_APP_ID`） | 飞书应用 ID |
-| `feishuAppSecret` | string | `''`（回退 `FEISHU_APP_SECRET`） | 飞书应用密钥 |
+| `feishuAppId` | string | `''`（回退 `FEISHU_APP_ID`） | 飞书应用 ID（未填时回退 `FEISHU_APP_ID`，再回退扫码凭据文件） |
+| `feishuAppSecret` | string | `''`（回退 `FEISHU_APP_SECRET`） | 飞书应用密钥（未填时回退 `FEISHU_APP_SECRET`，再回退扫码凭据文件） |
 | `stream` | boolean | `true` | 流式卡片总开关（每个会话可用 `/stream` 覆盖） |
 | `maxTurnMs` | number | `600000` | 看门狗时长：单回合超过该毫秒数则取消该回合，并回复错误卡片 |
 | `interruptAfterMs` | number | `0` | 插队阈值：运行中回合超过该毫秒数，新消息打断它优先处理（`0` = 立即打断） |
@@ -269,10 +292,12 @@ export FEISHU_APP_SECRET="xxxxxxxxxxxxxxxx"
 | `/new` | — | 同 `/reset`，开启新会话 |
 | `/workspace` | `[序号 \| 路径]` | 列出 / 切换工作区；`/workspace 0` 解除绑定（未分组，宿主默认 cwd）；`<路径>` 为已存在目录时自动创建并绑定；切换即开新会话（记忆清空） |
 | `/model` | `[序号]` | 列出可用模型，或 `/model <序号>` 切换（下一回合生效，记忆保留） |
+| `/effort` | `[档位]` | 查看/切换思考强度：/effort 或 /effort <档位> |
 | `/stream` | `on \| off` | 本会话流式回复开关（无参查看当前状态） |
 | `/cancel` | — | 取消当前运行中的回合（回合卡住时自救） |
 | `/resume` | `[序号]` | 列出最近 10 个会话（带摘要）或 `/resume <序号>` 切换恢复记忆；支持恢复同一工作区内 web 端创建的会话，已归档自动隐藏 |
 | `/restart` | — | 重连飞书长连接（不退出进程） |
+| `/setup` | — | 扫码授权飞书应用（生成授权链接，打开后扫码即完成配置） |
 | `/yolo` | `[off]` | 本会话免审批模式：权限预设切换为 `danger-full-access`，工具调用自动放行；`/yolo off` 恢复 `workspace-write`。内存态，重启自动关闭 |
 | `/squeeze` | `<内容>` | 以「强制排队」模式处理内容（等待当前回合完成后处理） |
 | `/steer` | `<内容>` | 以「强制插队」模式处理内容（打断当前回合优先处理） |
@@ -282,9 +307,9 @@ export FEISHU_APP_SECRET="xxxxxxxxxxxxxxxx"
 
 ## 🔐 安全说明
 
-- **凭据不落盘、不硬编码**：App ID / App Secret 仅通过环境变量或插件 Config 注入，仓库与源码中不含任何凭据；日志只记录机器人名称与消息摘要，不记录密钥。
+- **凭据不硬编码**：App ID / App Secret 通过环境变量、插件 Config 或扫码一键配置写入的凭据文件注入（`~/.dsh/dsh-feishu-bridge/credentials.json`，权限 0600），仓库与源码中不含任何凭据；日志只记录机器人名称与消息摘要，不记录密钥。
 - **无遥测、无外部上报**：插件只在 DSH 进程内与飞书开放平台通信，不向任何第三方发送数据。
-- **运行时数据本地存储**：`open_id`、chat id、会话代次 / 工作区绑定等仅写入本地状态文件（`~/.dsh/dsh-feishu-bridge/state.json`），不发送到任何远端。
+- **运行时数据本地存储**：`open_id`、chat id、会话代次 / 工作区绑定 / 思考强度偏好等仅写入本地状态文件（`~/.dsh/dsh-feishu-bridge/state.json`），不发送到任何远端。
 - **权限可控**：`/yolo` 免审批模式需用户显式开启，且为内存态——重启自动关闭，不会悄悄长驻高权限。
 
 ## ❓ 常见问题
@@ -304,6 +329,10 @@ export FEISHU_APP_SECRET="xxxxxxxxxxxxxxxx"
 **Q4：群聊里 @ 了机器人不回复？**
 
 群聊消息必须 @ 机器人才会进入处理（私聊无需 @）；另外机器人自身发出的消息会被忽略，不会自我对话。
+
+**Q5：为什么 /setup 每次都会创建新应用？**
+
+扫码流程采用 createOnly 设计，每次 `/setup`（或 `feishu_setup`）都会注册一个全新应用，因此重复执行会累积多个应用——这是预期行为。后续版本可支持在已有应用上更新（复用 App ID）。介意的话可到开发者后台删除旧应用。
 
 ## 📄 License
 
