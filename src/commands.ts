@@ -15,7 +15,7 @@
 
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk'
 import type { Context } from 'cordis'
-import { firstSentence } from './text.js'
+import { firstSentence, formatTokens } from './text.js'
 import type {
   BridgeAgent,
   BridgeAgentRegistry,
@@ -67,6 +67,12 @@ export interface CommandRuntime {
   queueDepth(chatId: string): number
   /** Current model label (durable: live agent request config → options → persisted log → default). */
   modelLabel(chatId: string): Promise<string>
+  /** Cumulative per-session token usage ({billed, output}), null when unknown. */
+  readCumulativeUsage(chatId: string): { billed: number; output: number } | null
+  /** The agent preset the chat's session runs on (creation header, then logged switches); undefined when the deployment composes none. */
+  agentPreset(chatId: string): Promise<string | undefined>
+  /** Reasoning effort the session actually ran with (live request header, then persisted request/header log); undefined when the model has none. */
+  reasoningEffort(chatId: string): Promise<string | undefined>
   restartChannel(): Promise<void>
 }
 
@@ -279,6 +285,65 @@ async function ensureResumable(runtime: CommandRuntime, chatId: string, sessionI
 }
 
 /**
+ * Render the /status reply text for one chat — the exact text the /status
+ * command sends. Shared with the restart announcement (index.ts) so every
+ * remembered chat gets a fresh per-chat snapshot without a manual /status:
+ * each chat has its own workspace/session, so the snapshot must be rendered
+ * per chatId with the same value sources the command uses.
+ */
+export async function renderStatus(runtime: CommandRuntime, chatId: string): Promise<string> {
+  const [model, preset, effort, usage] = await Promise.all([
+    runtime.modelLabel(chatId),
+    runtime.agentPreset(chatId),
+    runtime.reasoningEffort(chatId),
+    Promise.resolve(runtime.readCumulativeUsage(chatId)),
+  ])
+  const agentStatus = runtime.getAgent(chatId)?.status
+  const lines = [
+    `🤖 bot: ${runtime.channel.botIdentity?.name ?? runtime.appId}`,
+    `🧩 模型: ${model}`,
+    `💬 会话: ${runtime.sessionIdForChat(chatId)}`,
+    `📁 工作区: ${workspaceLabel(runtime, chatId)}`,
+  ]
+  // 四项扩展信息全部条件显示：无值（未装配/无 agent/无推理档位/用量未知）时不显示对应行，不编造。
+  if (preset !== undefined && preset !== '') lines.push(`🎛️ 模式: ${preset}`)
+  if (effort !== undefined && effort !== '') lines.push(`🧠 思考强度: ${effort}`)
+  if (usage !== null) lines.push(`🔢 token: billed ${formatTokens(usage.billed)} / output ${formatTokens(usage.output)}`)
+  if (agentStatus !== undefined) lines.push(`⚡ agent: ${agentStatus}`)
+  lines.push(
+    `🔄 流式: ${(runtime.chatStreamPrefs.get(chatId) ?? runtime.streamDefault) ? 'on' : 'off'}`,
+    `⏳ 队列深度: ${runtime.queueDepth(chatId)}`,
+    `🕐 运行时长: ${Math.round((Date.now() - runtime.STARTED_AT) / 60_000)} 分钟`,
+  )
+  const currentEpoch = runtime.epochFor(chatId)
+  let answers = (runtime.chatTranscript.get(chatId) ?? [])
+    .filter((e) => e.role === 'assistant' && e.epoch === currentEpoch)
+    .slice(-5)
+  if (answers.length === 0) {
+    // The in-memory transcript resets on plugin reload/restart; fall
+    // back to the current session's persisted log so excerpts survive
+    // restarts and /resume switches.
+    const sessionId = runtime.sessionIdForChat(chatId)
+    const persistence = runtime.ctx.get('sessionPersistence') as BridgeSessionPersistence | undefined
+    if (persistence !== undefined) {
+      try {
+        const { events } = await persistence.inspect(sessionId)
+        answers = latestAssistantAnswers(events ?? [], 5)
+          .map((text) => ({ role: 'assistant' as const, text, epoch: currentEpoch }))
+      } catch { /* keep empty */ }
+    }
+  }
+  if (answers.length > 0) {
+    lines.push('', '📜 当前会话最近回答（各取第一句）：')
+    answers.forEach((a, i) => {
+      const s = firstSentence(a.text)
+      if (s !== '') lines.push(`${i + 1}. ${s}`)
+    })
+  }
+  return lines.join('\n')
+}
+
+/**
  * Register the slash-command table against the bridge runtime and return the
  * dispatcher handle() uses. Command state mutations (epochs, workspace
  * binding, model preference) go through the runtime maps and persist().
@@ -305,41 +370,7 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
     status: {
       desc: '查看桥与当前会话状态（含最近对话）',
       async run(msg) {
-        const lines = [
-          `🤖 bot: ${runtime.channel.botIdentity?.name ?? runtime.appId}`,
-          `🧩 模型: ${await runtime.modelLabel(msg.chatId)}`,
-          `💬 会话: ${runtime.sessionIdForChat(msg.chatId)}`,
-          `📁 工作区: ${workspaceLabel(runtime, msg.chatId)}`,
-          `🔄 流式: ${(runtime.chatStreamPrefs.get(msg.chatId) ?? runtime.streamDefault) ? 'on' : 'off'}`,
-          `⏳ 队列深度: ${runtime.queueDepth(msg.chatId)}`,
-          `🕐 运行时长: ${Math.round((Date.now() - runtime.STARTED_AT) / 60_000)} 分钟`,
-        ]
-        const currentEpoch = runtime.epochFor(msg.chatId)
-        let answers = (runtime.chatTranscript.get(msg.chatId) ?? [])
-          .filter((e) => e.role === 'assistant' && e.epoch === currentEpoch)
-          .slice(-5)
-        if (answers.length === 0) {
-          // The in-memory transcript resets on plugin reload/restart; fall
-          // back to the current session's persisted log so excerpts survive
-          // restarts and /resume switches.
-          const sessionId = runtime.sessionIdForChat(msg.chatId)
-          const persistence = runtime.ctx.get('sessionPersistence') as BridgeSessionPersistence | undefined
-          if (persistence !== undefined) {
-            try {
-              const { events } = await persistence.inspect(sessionId)
-              answers = latestAssistantAnswers(events ?? [], 5)
-                .map((text) => ({ role: 'assistant' as const, text, epoch: currentEpoch }))
-            } catch { /* keep empty */ }
-          }
-        }
-        if (answers.length > 0) {
-          lines.push('', '📜 当前会话最近回答（各取第一句）：')
-          answers.forEach((a, i) => {
-            const s = firstSentence(a.text)
-            if (s !== '') lines.push(`${i + 1}. ${s}`)
-          })
-        }
-        await cmdReply(msg, lines.join('\n'))
+        await cmdReply(msg, await renderStatus(runtime, msg.chatId))
       },
     },
     reset: {
