@@ -15,6 +15,7 @@
 
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk'
 import type { Context } from 'cordis'
+import { saveCredentials, setupErrorMessage, type SetupFlow } from './setup.js'
 import { firstSentence, formatTokens } from './text.js'
 import type {
   BridgeAgent,
@@ -74,6 +75,10 @@ export interface CommandRuntime {
   /** Reasoning effort the session actually ran with (live request header, then persisted request/header log); undefined when the model has none. */
   reasoningEffort(chatId: string): Promise<string | undefined>
   restartChannel(): Promise<void>
+  /** Claim a fresh QR setup flow (null when one is already running per process). */
+  startSetup(): SetupFlow | null
+  /** Swap the bridge onto fresh credentials (saveCredentials is the caller's job) and reconnect. */
+  rebuildChannel(appId: string, appSecret: string): Promise<void>
 }
 
 /** Dispatcher handle() uses for any text starting with '/'. */
@@ -594,6 +599,40 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
         await cmdReply(msg, '♻️ 正在重连…')
         await runtime.restartChannel()
         await cmdReply(msg, '✅ 已重连。')
+      },
+    },
+    setup: {
+      desc: '扫码授权飞书应用（生成授权链接，打开后扫码即完成配置）',
+      async run(msg) {
+        const flow = runtime.startSetup()
+        if (flow === null) {
+          await cmdReply(msg, '⚠️ 已有配置流程在进行中，请等待其完成后再试。')
+          return
+        }
+        // 立即回复授权链接：registerApp 的 onQRCodeReady 是异步回调，链接生成
+        // 后即可先回复，不要等完整流程。
+        try {
+          const info = await flow.qrReady
+          await cmdReply(msg,
+            `🔗 请打开链接并用飞书扫码授权（${info.expireIn} 秒内有效）：\n${info.url}\n\n`
+            + '⚠️ 若应用创建后无法收发消息，请到开发者后台确认已开启机器人能力与 '
+            + 'im:message、im:message:send_as_bot 权限并发布版本。')
+        } catch (error) {
+          await cmdReply(msg, `❌ ${setupErrorMessage(error)}`)
+          return
+        }
+        // 后台等待授权完成：写凭据 + 重建连接（成功后新桥会向各聊天发送重启通知）。
+        void (async () => {
+          try {
+            const result = await flow.result
+            await cmdReply(msg, `✅ 已获取凭据（App ID: ${result.appId}），正在重连飞书…`)
+            saveCredentials(result)
+            await runtime.rebuildChannel(result.appId, result.appSecret)
+          } catch (error) {
+            runtime.log('feishu setup failed:', setupErrorMessage(error))
+            try { await cmdReply(msg, `❌ ${setupErrorMessage(error)}`) } catch { /* chat gone */ }
+          }
+        })()
       },
     },
     yolo: {
