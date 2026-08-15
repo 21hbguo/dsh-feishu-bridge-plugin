@@ -362,21 +362,37 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
         const target = arg.trim()
         const current = runtime.chatWorkspaces.get(msg.chatId)
         if (target === '') {
-          const lines = items.map((w, i) => {
+          // 0 = 未分组（web GUI 同语义）：会话不进任何工作区，用宿主默认 cwd。
+          const lines = [`0. 未分组（宿主默认 cwd）${current === undefined ? ' ← 当前' : ''}`]
+          lines.push(...items.map((w, i) => {
             const mark = w.id === current ? ' ← 当前' : ''
             return `${i + 1}. ${w.title} — ${w.path}${mark}`
-          })
-          if (lines.length === 0) lines.push('（还没有工作区；用 /workspace <路径> 添加一个已存在的目录）')
-          else if (current === undefined) lines.push('当前会话未绑定工作区（使用宿主默认 cwd）。')
-          lines.push('输入 /workspace <序号> 或 /workspace <路径> 切换（自动开新会话，记忆清空）。')
+          }))
+          if (lines.length === 1) lines.push('（还没有工作区；用 /workspace <路径> 添加一个已存在的目录）')
+          lines.push('输入 /workspace <序号> 或 /workspace <路径> 切换（自动开新会话，记忆清空）；/workspace 0 回到未分组。')
           await cmdReply(msg, lines.join('\n'))
+          return
+        }
+        // /workspace 0 = 解除工作区绑定（未分组，宿主默认 cwd），与 web GUI 的 0 一致。
+        if (target === '0') {
+          if (current === undefined) {
+            await cmdReply(msg, '当前已经是未分组（宿主默认 cwd），无需切换。')
+            return
+          }
+          runtime.chatWorkspaces.delete(msg.chatId)
+          const next = nextEpoch(runtime, msg.chatId)
+          runtime.chatEpochs.set(msg.chatId, next)
+          runtime.appendEpoch(msg.chatId, next)
+          runtime.chatSessionOverride.delete(msg.chatId)
+          runtime.persist()
+          await cmdReply(msg, '✅ 已解除工作区绑定（未分组，宿主默认 cwd），并开了新会话（记忆已清空）。')
           return
         }
         const n = Number.parseInt(target, 10)
         let workspace: BridgeWorkspace
         if (!Number.isNaN(n)) {
           const w = items[n - 1]
-          if (w === undefined) { await cmdReply(msg, `序号无效（可用 1-${items.length}，先 /workspace 查看）。`); return }
+          if (w === undefined) { await cmdReply(msg, `序号无效（可用 0-${items.length}，先 /workspace 查看）。`); return }
           if (w.id === current) { await cmdReply(msg, `已经是工作区 #${n}「${w.title}」，无需切换。`); return }
           workspace = w
         } else {
