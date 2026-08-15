@@ -16,6 +16,8 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk'
 import type { Context } from 'cordis'
 import z from 'schemastery'
+import { createBatcher } from './batching.js'
+import { registerApproval } from './approval.js'
 import { registerCommands } from './commands.js'
 import { registerQuestions } from './questions.js'
 import { buildChannel } from './lark.js'
@@ -55,6 +57,8 @@ export interface Config {
   streamThrottleChars: number
   /** 非流式回复截断阈值（字符）。 */
   maxReplyChars: number
+  /** 消息突发批处理窗口（ms）：窗口内同一聊天的连续普通消息合并为一条进 DSH；0 = 禁用。 */
+  batchWindowMs: number
 }
 
 export const Config = z.object({
@@ -66,6 +70,7 @@ export const Config = z.object({
   streamThrottleMs: z.number().default(40),
   streamThrottleChars: z.number().default(12),
   maxReplyChars: z.number().default(4000),
+  batchWindowMs: z.number().min(0).default(800),
 })
 
 /** One-line error text from any thrown value. */
@@ -206,6 +211,21 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   const agents = ctx.get('agents') as BridgeAgentRegistry | undefined
 
   /**
+   * Resolve the deployment's default model route. agents.create does NOT
+   * auto-apply the default model: the headless pattern passes
+   * `agentOptions: { provider, model }` explicitly, otherwise the persona's
+   * `{{model}}` template variable assembles empty and the turn errors out.
+   */
+  function defaultModelSelection(): BridgeModelPreference | undefined {
+    const dm = ctx.get('agentDefaultModel') as { currentSelection(): BridgeModelPreference } | undefined
+    const sel = dm?.currentSelection()
+    if (sel !== undefined && sel.provider !== '' && sel.model !== '') {
+      return { provider: sel.provider, model: sel.model }
+    }
+    return undefined
+  }
+
+  /**
    * Ensure the chat's live agent exists; creates it lazily with the standard
    * preset (bridge.mjs ensureSession). Command wiring: /model's preference is
    * passed as agentOptions, and /resume's epoch lands on a persisted session
@@ -216,7 +236,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     await ctx.get('loader')?.await()
     const live = agents.get(sessionId)
     if (live !== undefined) return live
-    const agentOptions = chatModelPrefs.get(chatId)
+    const agentOptions = chatModelPrefs.get(chatId) ?? defaultModelSelection()
     const persistence = ctx.get('sessionPersistence') as BridgeSessionPersistence | undefined
     if (persistence !== undefined) {
       const persisted = await persistence.list().then((list) => list.some((h) => h.id === sessionId)).catch(() => false)
@@ -520,39 +540,17 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     await channel.send(msg.chatId, { text }, { replyTo: msg.messageId })
   }
 
-  async function handle(msg: NormalizedMessage): Promise<void> {
-    const botOpenId = channel.botIdentity?.openId
-    if (msg.senderId === botOpenId) return
-    if (msg.chatType === 'group' && !msg.mentionedBot) return
-
-    let text = stripMentions(msg)
-    if (text === '') return
-    log(`message ${msg.messageId} chat=${msg.chatId} type=${msg.chatType} from=${msg.senderId}: ${text.slice(0, 80)}`)
-
-    // M18: a pending no-option question consumes the raw text as its answer.
-    if (await questions.answerPendingFreeText(msg.chatId, text)) return
-
-    // Per-message forced mode from /squeeze <内容> (queue) or /steer <内容> (steer).
-    let forced: 'queue' | 'steer' | undefined
-    const squeezeArg = /^\/squeeze (?=\S)/.test(text) ? text.slice('/squeeze '.length) : null
-    const steerArg = /^\/steer (?=\S)/.test(text) ? text.slice('/steer '.length) : null
-    if (squeezeArg !== null && squeezeArg !== 'on' && squeezeArg !== 'off') {
-      forced = 'queue'
-      text = squeezeArg.trim()
-      if (text === '') { await cmdReply(msg, '用法：/squeeze <内容>（强制排队）'); return }
-    } else if (steerArg !== null) {
-      forced = 'steer'
-      text = steerArg.trim()
-      if (text === '') { await cmdReply(msg, '用法：/steer <内容>（强制插队）'); return }
-    } else if (text.startsWith('/ai ')) {
-      const prompt = text.slice(4).trim()
-      if (prompt === '') { await cmdReply(msg, '用法：/ai <内容>'); return }
-      text = prompt
-    } else if (text.startsWith('/')) {
-      enqueueCommand(msg.chatId, () => runCommand(msg, text))
-      return
-    }
-
+  /**
+   * One plain message through the existing reply pipeline: queue/steer mode,
+   * interrupt-if-slow, user transcript, then the streaming or one-shot card
+   * branch. Shared by immediate (forced-mode / /ai / batching-disabled)
+   * messages and by batched flushes.
+   */
+  async function processNormalText(
+    msg: NormalizedMessage,
+    text: string,
+    forced: 'queue' | 'steer' | undefined,
+  ): Promise<void> {
     const mode = messageMode(msg.chatId, forced)
     // Queue mode: never interrupt the running turn. Steer mode (default): cut in line.
     if (mode === 'steer') await interruptIfSlow(msg.chatId)
@@ -591,6 +589,73 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
         await channel.send(msg.chatId, { text: `⚠️ 处理失败：${errorMessage(error).slice(0, 300)}` }, { replyTo: msg.messageId })
       } catch { /* already tried */ }
     }
+  }
+
+  /**
+   * Message burst batching: rapid plain messages in one chat merge into a
+   * single turn (config.batchWindowMs; 0 = disabled). Commands and forced
+   * modes never reach the batcher — see handle(). Lifecycle rides the bridge
+   * runtime: dispose() clears every pending window and timer.
+   */
+  const batcher = config.batchWindowMs > 0
+    ? createBatcher<NormalizedMessage>({
+        windowMs: config.batchWindowMs,
+        onFlush: (chatId, text, count, msg) => {
+          log(`batched ${count} message(s) into one turn (chat=${chatId})`)
+          void processNormalText(msg, text, undefined).catch((error) => {
+            log('batched turn failed:', errorMessage(error))
+          })
+        },
+        log,
+      })
+    : undefined
+
+  async function handle(msg: NormalizedMessage): Promise<void> {
+    const botOpenId = channel.botIdentity?.openId
+    if (msg.senderId === botOpenId) return
+    if (msg.chatType === 'group' && !msg.mentionedBot) return
+
+    let text = stripMentions(msg)
+    if (text === '') return
+    log(`message ${msg.messageId} chat=${msg.chatId} type=${msg.chatType} from=${msg.senderId}: ${text.slice(0, 80)}`)
+
+    // M18: a pending no-option question consumes the raw text as its answer.
+    if (await questions.answerPendingFreeText(msg.chatId, text)) return
+
+    // Per-message forced mode from /squeeze <内容> (queue) or /steer <内容> (steer).
+    // Forced modes and /ai are explicit intent — never batched with neighbors.
+    let forced: 'queue' | 'steer' | undefined
+    let batched = true
+    const squeezeArg = /^\/squeeze (?=\S)/.test(text) ? text.slice('/squeeze '.length) : null
+    const steerArg = /^\/steer (?=\S)/.test(text) ? text.slice('/steer '.length) : null
+    if (squeezeArg !== null && squeezeArg !== 'on' && squeezeArg !== 'off') {
+      forced = 'queue'
+      batched = false
+      text = squeezeArg.trim()
+      if (text === '') { await cmdReply(msg, '用法：/squeeze <内容>（强制排队）'); return }
+    } else if (steerArg !== null) {
+      forced = 'steer'
+      batched = false
+      text = steerArg.trim()
+      if (text === '') { await cmdReply(msg, '用法：/steer <内容>（强制插队）'); return }
+    } else if (text.startsWith('/ai ')) {
+      batched = false
+      const prompt = text.slice(4).trim()
+      if (prompt === '') { await cmdReply(msg, '用法：/ai <内容>'); return }
+      text = prompt
+    } else if (text.startsWith('/')) {
+      enqueueCommand(msg.chatId, () => runCommand(msg, text))
+      return
+    }
+
+    // Batch window: only plain messages (no forced mode, no /ai) enter the
+    // per-chat burst window; commands and forced modes bypass it. A pending
+    // window is untouched by a command and still flushes on its own timer.
+    if (!batched || batcher === undefined) {
+      await processNormalText(msg, text, forced)
+      return
+    }
+    batcher.push(msg.chatId, text, msg)
   }
 
   // ------------------------------------------------------------ transcript + commands (M17 subset)
@@ -662,6 +727,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   }
 
   const questions = registerQuestions({ ctx, channel, chatIdForSession, log })
+  const approvals = registerApproval({ ctx, channel, chatIdForSession, log })
 
   // ------------------------------------------------------------ lifecycle (M19/M20 in-process)
   let connectRetryTimer: NodeJS.Timeout | undefined
@@ -712,6 +778,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     }
     sessionListeners.clear()
     try { questions.dispose() } catch { /* already gone */ }
+    try { approvals.dispose() } catch { /* already gone */ }
+    batcher?.dispose()
     void channel.disconnect().catch(() => { /* already gone */ })
   }
 
