@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-feishu-bridge",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "飞书机器人 ↔ DSH 对话桥：进程内驱动 DSH 会话，流式卡片回复",
   "type": "module",
   "main": "./lib/index.js",
