@@ -1,15 +1,15 @@
 /**
- * Slash-command table (bridge.mjs M17), extracted from src/index.ts into its
- * own module. registerCommands(runtime) receives every piece of bridge state
- * the commands touch and returns the dispatcher (runCommand) that handle()
- * enqueues. The runtime parameter is the only coupling, so this module never
- * imports src/index.ts (the dependency direction stays acyclic).
+ * Slash-command table, extracted from src/index.ts into its own module.
+ * registerCommands(runtime) receives every piece of bridge state the commands
+ * touch and returns the dispatcher (runCommand) that handle() enqueues. The
+ * runtime parameter is the only coupling, so this module never imports
+ * src/index.ts (the dependency direction stays acyclic).
  *
  * Beyond the ported /help /ping /status /reset /new /stream /cancel /restart,
- * this module adds the three in-process commands bridge.mjs left for later:
- * /workspace (workspaceRegistry.list/create + chatWorkspaces binding),
- * /model (llm catalog + per-chat preference applied on the next turn), and
- * /resume (sessions.list / agents.roots / sessionPersistence history with
+ * this module adds three in-process commands: /workspace
+ * (workspaceRegistry.list/create + chatWorkspaces binding), /model (llm
+ * catalog + per-chat preference applied on the next turn), and /resume
+ * (sessions.list / agents.roots / sessionPersistence history with
  * latest-answer excerpts, switching via agents.resume).
  */
 
@@ -81,7 +81,7 @@ interface Command {
   run(msg: NormalizedMessage, arg: string): Promise<void>
 }
 
-/** Next epoch for a chat: `${EPOCH}-<count+1>` (bridge.mjs /reset /workspace). */
+/** Next epoch for a chat: `${EPOCH}-<count+1>`. */
 function nextEpoch(runtime: CommandRuntime, chatId: string): string {
   const n = Number(runtime.chatEpochs.get(chatId)?.split('-').pop() ?? 0)
   return `${runtime.EPOCH}-${n + 1}`
@@ -185,8 +185,8 @@ interface ResumeRow {
  * of that workspace (feishu-* and web session-* alike — the shared pool the
  * web GUI shows); without one, the chat's own feishu-* sessions (legacy).
  * Live sessions (sessions.list / agents.roots) are merged with cold persisted
- * sessions, ranked by creation time, with latest-answer excerpts (bridge.mjs
- * recentSessions/latestAnswer). Archived sessions are hidden.
+ * sessions, ranked by creation time, with latest-answer excerpts. Archived
+ * sessions are hidden.
  */
 async function recentSessions(runtime: CommandRuntime, chatId: string): Promise<ResumeRow[]> {
   const slug = chatId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40)
@@ -201,9 +201,9 @@ async function recentSessions(runtime: CommandRuntime, chatId: string): Promise<
   const registry = runtime.ctx.get('workspaceRegistry') as BridgeWorkspaceRegistry | undefined
   const archived = new Set<string>(registry?.archivedSessionIds ?? [])
 
-  // Scope to the chat's current workspace (bridge.mjs web mode): the bound
-  // workspace's sessionIds is the authoritative membership. No bound workspace
-  // → keep all feishu sessions (legacy behavior).
+  // Scope to the chat's current workspace: the bound workspace's sessionIds
+  // is the authoritative membership. No bound workspace → keep all feishu
+  // sessions (legacy behavior).
   let allowed: Set<string> | null = null
   const bound = runtime.chatWorkspaces.get(chatId)
   if (bound !== undefined) {
@@ -321,7 +321,7 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
         if (answers.length === 0) {
           // The in-memory transcript resets on plugin reload/restart; fall
           // back to the current session's persisted log so excerpts survive
-          // restarts and /resume switches (bridge.mjs /resume pattern).
+          // restarts and /resume switches.
           const sessionId = runtime.sessionIdForChat(msg.chatId)
           const persistence = runtime.ctx.get('sessionPersistence') as BridgeSessionPersistence | undefined
           if (persistence !== undefined) {
@@ -349,7 +349,7 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
         // Clear the session override BEFORE any persist: appendEpoch persists
         // synchronously, so deleting after it left a stale web-session binding
         // in state.json (survives reloads/restarts) — the /new escape hatch
-        // silently failed. (f4c1642 regression)
+        // silently failed.
         runtime.chatSessionOverride.delete(msg.chatId)
         runtime.chatEpochs.set(msg.chatId, next)
         runtime.appendEpoch(msg.chatId, next)
@@ -593,7 +593,7 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
         }
         // 顺序关键：先 setPolicy（写 approval/policy 事件 + 注入模型可见通知），
         // 再 permissionPresets.set()——set() 内部写 approval knob 时值已相同则幂等
-        // 跳过，不会让 setPolicy 的通知因 early-return 丢失（调研报告 §5.1）。
+        // 跳过，不会让 setPolicy 的通知因 early-return 丢失。
         approval.setPolicy(agent, 'never')
         presets.set(agent.session, 'danger-full-access')
         runtime.chatYoloPrefs.set(msg.chatId, true)

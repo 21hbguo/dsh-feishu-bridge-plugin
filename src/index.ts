@@ -1,16 +1,14 @@
 /**
  * @dsh-external/dsh-feishu-bridge — 飞书机器人 ↔ DSH 对话桥（DSH 进程内 Cordis 插件）。
  *
- * 从独立进程 bridge.mjs（1343 行）移植：原「web BFF HTTP RPC + events.mux
- * WebSocket」的 DSH 访问层（bridge.mjs M5/M6/M7/M8）替换为进程内 ctx 服务直调
- * （ctx.get('agents') + ctx.on('session/event') + agent.followup/steer/cancel），
- * 其余业务逻辑照搬：飞书 Channel 收发与流式卡片（M4/M12）、每 chat 串行队列与
- * 插队（M9/M13）、看门狗（M16，超时改为 cancel + 错误卡片，**不退出进程**）、
- * @提及剥离/截断/token 格式化（M10）、handle 入口（M15）、斜杠命令子集（M17）。
+ * DSH 访问走进程内 ctx 服务直调（ctx.get('agents') + ctx.on('session/event') +
+ * agent.followup/steer/cancel）。业务逻辑：飞书 Channel 收发与流式卡片、每 chat
+ * 串行队列与插队、看门狗（超时 cancel + 错误卡片，**不退出进程**）、@提及剥离/
+ * 截断/token 格式化、handle 入口、斜杠命令子集。
  *
- * 明确不做：RUNTIME=local 模式（M8）、任何 UI/client 代码与模型工具注册。
- * M18 提问/问答卡片系统见 src/questions.ts（进程内 api.respond，不注册
- * userQuestions provider）；/workspace /model /resume 命令见 src/commands.ts。
+ * 明确不做：RUNTIME=local 模式、任何 UI/client 代码与模型工具注册。
+ * 提问/问答卡片系统见 src/questions.ts（进程内 api.respond，不注册 userQuestions
+ * provider）；/workspace /model /resume 命令见 src/commands.ts。
  */
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk'
@@ -81,7 +79,7 @@ function errorMessage(error: unknown): string {
 }
 
 export function apply(ctx: Context, config: Config): void {
-  // Credentials: Config wins, environment as fallback (bridge.mjs M2 env semantics).
+  // Credentials: Config wins, environment as fallback.
   const appId = config.feishuAppId !== '' ? config.feishuAppId : (process.env.FEISHU_APP_ID ?? '')
   const appSecret = config.feishuAppSecret !== '' ? config.feishuAppSecret : (process.env.FEISHU_APP_SECRET ?? '')
   if (appId === '' || appSecret === '') {
@@ -128,7 +126,7 @@ interface BridgeRuntime {
 }
 
 function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId: string): BridgeRuntime {
-  // ------------------------------------------------------------ persistent state (M3)
+  // ------------------------------------------------------------ persistent state
   const state: BridgeState = loadState()
   const chatEpochs = new Map(Object.entries(state.chatEpochs))
   const chatSessionList = new Map(Object.entries(state.chatSessionList))
@@ -144,7 +142,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     console.error(`[${name} ${new Date().toISOString().slice(11, 19)}]`, ...args)
   }
 
-  /** Refresh the in-memory maps into `state` and write the file (bridge.mjs saveState). */
+  /** Refresh the in-memory maps into `state` and write the file. */
   function persist(): void {
     state.chatEpochs = Object.fromEntries(chatEpochs)
     state.chatSessionList = Object.fromEntries(chatSessionList)
@@ -153,7 +151,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     saveState(state)
   }
 
-  /** Register an epoch in the chat's history list (bridge.mjs rememberSession). */
+  /** Register an epoch in the chat's history list. */
   function appendEpoch(chatId: string, epoch: string): void {
     const list = chatSessionList.get(chatId) ?? []
     if (!list.includes(epoch)) {
@@ -163,7 +161,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     }
   }
 
-  /** Current epoch for a chat, minting '0' on first contact (bridge.mjs sessionIdFor/rememberSession). */
+  /** Current epoch for a chat, minting '0' on first contact. */
   function epochFor(chatId: string): string {
     const existing = chatEpochs.get(chatId)
     if (existing !== undefined) return existing
@@ -183,7 +181,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   const sessionListeners = new Map<string, Set<(ev: BridgeSessionEvent) => void>>()
   const usageBySession = new Map<string, { billed: number; output: number }>()
 
-  /** Register a per-session event listener; returns its disposer (bridge.mjs onSessionEvent). */
+  /** Register a per-session event listener; returns its disposer. */
   function onSessionEvent(sessionId: string, fn: (ev: BridgeSessionEvent) => void): () => void {
     const set = sessionListeners.get(sessionId) ?? new Set()
     set.add(fn)
@@ -202,7 +200,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     usageBySession.set(sessionId, cur)
   }
 
-  /** Global session/event dispatch: usage bookkeeping + per-session fan-out (replaces mux). */
+  /** Global session/event dispatch: usage bookkeeping + per-session fan-out. */
   function onGlobalSessionEvent(sessionId: string, event: BridgeSessionEvent): void {
     if (event.type === 'assistant/message' && event.data.usage !== undefined) {
       accumulateUsage(sessionId, event.data.usage)
@@ -214,7 +212,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     }
   }
 
-  // ------------------------------------------------------------ agent driving (M7 in-process)
+  // ------------------------------------------------------------ agent driving
   const agents = ctx.get('agents') as BridgeAgentRegistry | undefined
 
   /**
@@ -234,9 +232,9 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
 
   /**
    * Ensure the chat's live agent exists; creates it lazily with the standard
-   * preset (bridge.mjs ensureSession). Command wiring: /model's preference is
-   * passed as agentOptions, and /resume's epoch lands on a persisted session
-   * that is resumed (live → persistence → create fallback, like the web BFF).
+   * preset. Command wiring: /model's preference is passed as agentOptions, and
+   * /resume's epoch lands on a persisted session that is resumed (live →
+   * persistence → create fallback).
    */
   async function ensureAgent(chatId: string, sessionId: string): Promise<BridgeAgent> {
     if (agents === undefined) throw new Error(`${name}: agents service is unavailable`)
@@ -258,15 +256,14 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
       }
     }
     // /workspace binding: create the session in the bound workspace's directory
-    // and attach it, so the workspace's sessionIds membership stays accurate
-    // (web BFF session.create derives cwd from workspaceId the same way).
+    // and attach it, so the workspace's sessionIds membership stays accurate.
     const workspaceId = chatWorkspaces.get(chatId)
     const workspace = workspaceId !== undefined
       ? (ctx.get('workspaceRegistry') as BridgeWorkspaceRegistry | undefined)?.get(workspaceId)
       : undefined
     const cwd = workspace?.path ?? process.cwd()
-    // Follow the deployment's default agent preset (settings agent-presets.default),
-    // falling back to the standard preset when the roster is not mounted.
+    // Follow the deployment's default agent preset, falling back to the
+    // standard preset when the roster is not mounted.
     const presetId = (ctx.get('agentPresets') as { defaultId: string } | undefined)?.defaultId ?? 'standard'
     const { agent } = await agents.create({
       sessionId,
@@ -283,7 +280,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     return agent
   }
 
-  // ------------------------------------------------------------ queue / watchdog (M9/M13/M16)
+  // ------------------------------------------------------------ queue / watchdog
   const queues = new Map<string, Promise<unknown>>() // chatId -> message chain
   const chatPending = new Map<string, number>() // chatId -> queued+running turn count
   const commandQueues = new Map<string, Promise<unknown>>() // chatId -> command chain
@@ -303,7 +300,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     }
   }
 
-  /** Slash commands run on their own per-chat chain (bridge.mjs enqueueCommand). */
+  /** Slash commands run on their own per-chat chain. */
   function enqueueCommand(chatId: string, task: () => Promise<void>): Promise<void> {
     const prev = commandQueues.get(chatId) ?? Promise.resolve()
     const next = prev.catch(() => {}).then(task)
@@ -311,7 +308,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     return next
   }
 
-  /** Serialize one turn per chat; a timeout rejects with TurnTimeoutError (bridge.mjs enqueue). */
+  /** Serialize one turn per chat; a timeout rejects with TurnTimeoutError. */
   function enqueue<T>(chatId: string, task: () => Promise<T>): Promise<T> {
     chatPending.set(chatId, (chatPending.get(chatId) ?? 0) + 1)
     const prev = queues.get(chatId) ?? Promise.resolve()
@@ -327,7 +324,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     return next
   }
 
-  /** Race one turn against MAX_TURN_MS (bridge.mjs runWithWatchdog). */
+  /** Race one turn against maxTurnMs. */
   async function runWithWatchdog<T>(task: () => Promise<T>): Promise<T> {
     let timer: NodeJS.Timeout | undefined
     try {
@@ -344,7 +341,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
 
   /**
    * One in-process turn: ensure the agent, subscribe to its session events,
-   * followup/steer the message, settle at turn/end (bridge.mjs thinkWeb).
+   * followup/steer the message, settle at turn/end.
    * @param mode - 'queue' waits for the current turn; 'steer' injects into it.
    * @param onStatus - optional live progress callback (tool calls) so multi-step
    * turns show activity on the streaming card instead of a static "思考中".
@@ -439,7 +436,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     }
   }
 
-  /** Interrupt a running turn so the new message gets processed promptly (M13); threshold 0 = always. */
+  /** Interrupt a running turn so the new message gets processed promptly; threshold 0 = always. */
   async function interruptIfSlow(chatId: string): Promise<void> {
     const running = chatTurns.get(chatId)
     if (running === undefined) return
@@ -448,10 +445,10 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     running.cancel()
   }
 
-  // ------------------------------------------------------------ usage / reply cards (M11)
+  // ------------------------------------------------------------ usage / reply cards
   /**
    * Cumulative per-session usage: event-accumulated tokens first, falling back
-   * to ctx.tokenMeter when it is present (task: 判空兜底).
+   * to ctx.tokenMeter when it is present.
    */
   function readCumulativeUsage(chatId: string): { billed: number; output: number } | null {
     const sessionId = sessionIdForChat(chatId)
@@ -508,7 +505,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     }
   }
 
-  // ------------------------------------------------------------ streaming answer (M12)
+  // ------------------------------------------------------------ streaming answer
   /** Streaming reply card fed live from DSH chunk events. */
   async function streamAnswer(msg: NormalizedMessage, text: string, mode: 'queue' | 'steer' = 'queue'): Promise<void> {
     try {
@@ -555,7 +552,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     }
   }
 
-  // ------------------------------------------------------------ watchog timeout (M16 in-process)
+  // ------------------------------------------------------------ watchdog timeout
   /** Watchdog timeout: cancel the turn and reply an error card — never exit the process. */
   async function handleTimeout(msg: NormalizedMessage): Promise<void> {
     log('watchdog: turn timed out, cancelling the turn')
@@ -566,7 +563,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     } catch { /* already tried */ }
   }
 
-  // ------------------------------------------------------------ message entry (M15)
+  // ------------------------------------------------------------ message entry
   const chatStreamPrefs = new Map<string, boolean>()
   const chatQueuePrefs = new Map<string, boolean>()
   /** Per-chat model preference set by /model; applied on the next create/resume. */
@@ -574,7 +571,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   /** Per-chat YOLO 免审批开关（/yolo 设置；内存态，重启自动关闭，不持久化）。 */
   const chatYoloPrefs = new Map<string, boolean>()
 
-  /** Per-chat queue preference: true = queue, false/absent = steer (bridge.mjs messageMode). */
+  /** Per-chat queue preference: true = queue, false/absent = steer. */
   function messageMode(chatId: string, forced: 'queue' | 'steer' | undefined): 'queue' | 'steer' {
     if (forced === 'queue' || forced === 'steer') return forced
     return chatQueuePrefs.get(chatId) === true ? 'queue' : 'steer'
@@ -663,7 +660,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     if (text === '') return
     log(`message ${msg.messageId} chat=${msg.chatId} type=${msg.chatType} from=${msg.senderId}: ${text.slice(0, 80)}`)
 
-    // M18: a pending no-option question consumes the raw text as its answer.
+    // A pending no-option question consumes the raw text as its answer.
     if (await questions.answerPendingFreeText(msg.chatId, text)) return
 
     // Per-message forced mode from /squeeze <内容> (queue) or /steer <内容> (steer).
@@ -702,7 +699,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     batcher.push(msg.chatId, text, msg)
   }
 
-  // ------------------------------------------------------------ transcript + commands (M17 subset)
+  // ------------------------------------------------------------ transcript + commands
   interface TranscriptEntry { role: 'user' | 'assistant'; text: string; epoch: string }
   const chatTranscript = new Map<string, TranscriptEntry[]>()
 
@@ -766,7 +763,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     return '—'
   }
 
-  // ------------------------------------------------------------ commands (M17 in src/commands.ts)
+  // ------------------------------------------------------------ commands (see src/commands.ts)
   // The slash-command table lives in src/commands.ts; the runtime hands
   // registerCommands every piece of state the commands touch, and the returned
   // dispatcher is what handle() enqueues for '/'-prefixed messages.
@@ -797,8 +794,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     restartChannel,
   }).runCommand
 
-  // ------------------------------------------------------------ questions (M18 in src/questions.ts)
-  /** Reverse-map a DSH session id back to the Feishu chat that owns it (bridge.mjs chatIdForSession 1021). */
+  // ------------------------------------------------------------ questions (see src/questions.ts)
+  /** Reverse-map a DSH session id back to the Feishu chat that owns it. */
   function chatIdForSession(sessionId: string): string | undefined {
     for (const [chatId, epochs] of chatSessionList) {
       for (const epoch of epochs) {
@@ -816,7 +813,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   }
   const approvals = registerApproval({ ctx, channel, chatIdForSession, isYolo, log })
 
-  // ------------------------------------------------------------ lifecycle (M19/M20 in-process)
+  // ------------------------------------------------------------ lifecycle
   let connectRetryTimer: NodeJS.Timeout | undefined
   let firstConnectDone = false
 

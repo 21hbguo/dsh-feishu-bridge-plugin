@@ -1,37 +1,35 @@
 /**
- * M18 提问/问答卡片系统（进程内版，bridge.mjs 946-1282 移植）。
+ * 提问/问答卡片系统（进程内版）。
  *
- * agent 用 ask_user_question 提问时，host 侧 api-proxy 的 user-questions provider
- * mint rpcId 并把 `question/requested` 帧推送到 events.mux（api-proxy.ts:1377,
- * 1390-1394）；本模块订阅 mux 流（进程内直调 `ctx.apiProxy.events.mux`，不走
- * HTTP/WS），按 `chatIdForSession` 反查飞书 chat，渲染交互卡片；用户点按钮/
- * 勾选/确认后，用 `ctx.apiProxy.respond(ClientResponse)` 把回答提交回 host
- * （api-proxy.ts:3696-3742，不注册 userQuestions provider，避免与 api-proxy
- * 撞 DUPLICATE_PROVIDER）。
+ * agent 用 ask_user_question 提问时，host 侧的 user-questions provider mint
+ * rpcId 并把 `question/requested` 帧推送到 events.mux；本模块订阅 mux 流（进程内
+ * 直调 `ctx.apiProxy.events.mux`，不走 HTTP/WS），按 `chatIdForSession` 反查飞书
+ * chat，渲染交互卡片；用户点按钮/勾选/确认后，用 `ctx.apiProxy.respond
+ * (ClientResponse)` 把回答提交回 host（不注册 userQuestions provider，避免与
+ * host 自带的 provider 撞 DUPLICATE_PROVIDER）。
  *
- * 与 bridge.mjs 的差异：回答提交从 `fetch POST /api/respond` 换成进程内
- * `api.respond()`；过期 reaper 撤卡片之外还向 host 提交 cancelled（修复
- * bridge 缺口：host 侧 pending 不再永久悬挂）。
+ * 与独立进程版的差异：回答提交从 `fetch POST /api/respond` 换成进程内
+ * `api.respond()`；过期 reaper 撤卡片之外还向 host 提交 cancelled（host 侧
+ * pending 不再永久悬挂）。
  *
  * 接线（由 index.ts 统一做，本文件不 import index.ts）：apply 的 effect 内调用
  * `registerQuestions({ ctx, channel, chatIdForSession, log })`，把返回的
  * `dispose` 并入 teardown；若要在聊天里用文字回答「无选项」问题，把返回的
  * `answerPendingFreeText(chatId, text)` 挂到 message 处理入口（消费返回 true
- * 时不启动回合，bridge.mjs answerPendingFreeText 1099）。
+ * 时不启动回合）。
  */
 import { randomUUID } from 'node:crypto'
 import type { CardActionEvent, LarkChannel } from '@larksuiteoapi/node-sdk'
 import type { Context } from 'cordis'
 
-/** Pending ask 有效期：发卡后 10 分钟未答即过期（bridge.mjs 1078）。 */
+/** Pending ask 有效期：发卡后 10 分钟未答即过期。 */
 const QUESTION_TTL_MS = 10 * 60 * 1000
-/** 过期回收扫描周期（bridge.mjs 1273）。 */
+/** 过期回收扫描周期。 */
 const REAPER_INTERVAL_MS = 60 * 1000
 
 // ---------------------------------------------------------------------------
 // apiproxy 契约的进程内视图（结构镜像，不 import @deepseek-ai/dsh-host-apiproxy
-// —— 未声明的依赖；取值自 api/events.ts:69-75、api/rpc.ts:179-193、
-// api/questions.ts、api-proxy.ts:716-733、3696-3742）
+// —— 未声明的依赖）
 // ---------------------------------------------------------------------------
 
 /** 卡片回调按钮 value 编码：`ask|rpcId|qIndex|optionIndex`。 */
@@ -49,19 +47,19 @@ function questionSubmitValue(rpcId: string): string {
   return `asksubmit|${rpcId}`
 }
 
-/** 选项的显示文案：label 优先，其次 value，最后是占位（bridge.mjs 986/995）。 */
+/** 选项的显示文案：label 优先，其次 value，最后是占位。 */
 function optionLabel(opt: BridgeQuestionOption, optionIndex: number): string {
   return String(opt.label ?? opt.value ?? `选项 ${optionIndex + 1}`)
 }
 
-/** AskUserQuestionItem 的进程内视图（dsh-user-questions/types.ts:35-50 镜像）。 */
+/** AskUserQuestionItem 的进程内视图。 */
 interface BridgeQuestionOption {
   label?: string
   value?: string
   description?: string
 }
 
-/** AskUserQuestionItem 的进程内视图（dsh-user-questions/types.ts:35-50 镜像）。 */
+/** AskUserQuestionItem 的进程内视图。 */
 interface BridgeQuestion {
   id: string
   question: string
@@ -72,14 +70,14 @@ interface BridgeQuestion {
   intent?: { kind: string; approve: string }
 }
 
-/** 一次 ask 批次（question/requested 帧载荷，api/events.ts:74 镜像）。 */
+/** 一次 ask 批次（question/requested 帧载荷）。 */
 interface BridgeQuestionRequestedFrame {
   type: 'question/requested'
   sessionId: string
   questions: BridgeQuestion[]
 }
 
-/** 提问已结算（question/resolved 帧载荷，api/events.ts:75 镜像）。 */
+/** 提问已结算（question/resolved 帧载荷）。 */
 interface BridgeQuestionResolvedFrame {
   type: 'question/resolved'
   sessionId: string
@@ -97,14 +95,14 @@ interface BridgeMuxPayload {
   [key: string]: unknown
 }
 
-/** AskUserQuestionAnswerItem 的进程内视图（dsh-user-questions/types.ts:53-60 镜像）。 */
+/** AskUserQuestionAnswerItem 的进程内视图。 */
 interface BridgeAnswerItem {
   id: string
   selected: string[]
   custom?: string
 }
 
-/** ClientResponse 信封（api/rpc.ts:179-183 镜像；error 只走 cancelled 分支）。 */
+/** ClientResponse 信封（error 只走 cancelled 分支）。 */
 interface BridgeClientResponse {
   type: 'client-response'
   rpcId: string
@@ -113,10 +111,10 @@ interface BridgeClientResponse {
     | { ok: false; error: { code: 'cancelled'; message: string; details: Record<string, never> } }
 }
 
-/** RpcReceipt（api/rpc.ts:193 镜像）。 */
+/** RpcReceipt。 */
 type BridgeRpcReceipt = { accepted: true } | { accepted: false; reason: 'not-pending' | 'bad-response' }
 
-/** ApiProxy 的进程内视图：只取 events.mux + respond 两个面（api/index.ts:22-42）。 */
+/** ApiProxy 的进程内视图：只取 events.mux + respond 两个面。 */
 interface BridgeApiProxy {
   events: {
     mux(request: { rpcId: string; payload: Record<string, unknown> }, signal: AbortSignal): AsyncIterable<{ rpcId: string; payload: BridgeMuxPayload }>
@@ -130,7 +128,7 @@ export interface QuestionRuntime {
   ctx: Context
   /** 飞书 channel：发卡/更新卡/卡片回调。 */
   channel: LarkChannel
-  /** 反查拥有某 DSH sessionId 的飞书 chat（bridge.mjs chatIdForSession 1021）。 */
+  /** 反查拥有某 DSH sessionId 的飞书 chat。 */
   chatIdForSession(sessionId: string): string | undefined
   /** 日志（复用 runtime.log）。 */
   log(...args: unknown[]): void
@@ -141,14 +139,13 @@ export interface QuestionBridge {
   /** 卸载：中止 mux 订阅、摘 cardAction 监听、停 reaper，并把仍在 pending 的 ask 全部 cancelled 提交回 host。 */
   dispose(): void
   /**
-   * 消费聊天里的自由文本，作为该 chat 最新 pending 卡片的「无选项」问题答案
-   * （bridge.mjs answerPendingFreeText 1099）。返回 true 表示已被消费（消息
-   * 处理入口不应再启动回合）。
+   * 消费聊天里的自由文本，作为该 chat 最新 pending 卡片的「无选项」问题答案。
+   * 返回 true 表示已被消费（消息处理入口不应再启动回合）。
    */
   answerPendingFreeText(chatId: string, text: string): Promise<boolean>
 }
 
-/** 一条 pending ask 的本地登记（bridge.mjs 948-952 的 pendingQuestions 行）。 */
+/** 一条 pending ask 的本地登记。 */
 interface PendingQuestionEntry {
   chatId: string
   sessionId: string
@@ -166,22 +163,22 @@ function errorMessage(error: unknown): string {
 }
 
 /**
- * 装配 M18 提问系统：订阅进程内 question/requested → 发飞书交互卡；cardAction
+ * 装配提问系统：订阅进程内 question/requested → 发飞书交互卡；cardAction
  * 路由 ask/askm/asksubmit；question/resolved → 结算卡片；10 分钟过期 reaper
  * （撤卡 + 向 host 提交 cancelled）。
  *
- * apiProxy 服务可能晚于本插件装配（web-app bundle 顺序不定）：先即时尝试，若
- * 未就绪则等 loader.await() 后再试一次；两种情况下都没有 apiProxy 就静默降级
- * （question 卡片功能关闭，插件其余功能不受影响）。
+ * apiProxy 服务可能晚于本插件装配：先即时尝试，若未就绪则等 loader.await()
+ * 后再试一次；两种情况下都没有 apiProxy 就静默降级（question 卡片功能关闭，
+ * 插件其余功能不受影响）。
  */
 export function registerQuestions(runtime: QuestionRuntime): QuestionBridge {
   const { ctx, channel, chatIdForSession, log } = runtime
 
-  /** pendingQuestions: question rpcId -> entry（bridge.mjs 950）。 */
+  /** pendingQuestions: question rpcId -> entry。 */
   const pendingQuestions = new Map<string, PendingQuestionEntry>()
-  /** chatId -> 该 chat 最新的 pending entry（bridge.mjs 952）。 */
+  /** chatId -> 该 chat 最新的 pending entry。 */
   const pendingQuestionByChat = new Map<string, PendingQuestionEntry>()
-  /** cardId -> 下一个更新序列号：必须从小递增，飞书拒绝 epoch 时间戳（9499）。 */
+  /** cardId -> 下一个更新序列号：必须从小递增，飞书拒绝 epoch 时间戳。 */
   const cardkitSequences = new Map<string, number>()
 
   const ac = new AbortController()
@@ -189,7 +186,7 @@ export function registerQuestions(runtime: QuestionRuntime): QuestionBridge {
   let started = false
   let disposed = false
 
-  /** 发卡片实体 + 引用发送，之后可用 card_id 全量更新（bridge.mjs sendCardkit 1032）。 */
+  /** 发卡片实体 + 引用发送，之后可用 card_id 全量更新。 */
   async function sendCardkit(chatId: string, card: object): Promise<{ messageId: string; cardId: string }> {
     const r = await channel.rawClient.cardkit.v1.card.create({
       data: { type: 'card_json', data: JSON.stringify(card) },
@@ -200,7 +197,7 @@ export function registerQuestions(runtime: QuestionRuntime): QuestionBridge {
     return { messageId, cardId }
   }
 
-  /** 按 card_id 全量更新卡片实体（bridge.mjs updateCardkit 1047）。 */
+  /** 按 card_id 全量更新卡片实体。 */
   async function updateCardkit(cardId: string, card: object): Promise<void> {
     const sequence = (cardkitSequences.get(cardId) ?? 0) + 1
     cardkitSequences.set(cardId, sequence)
@@ -210,13 +207,13 @@ export function registerQuestions(runtime: QuestionRuntime): QuestionBridge {
     })
   }
 
-  /** 从两张登记表摘除一条 pending（bridge.mjs 1123-1124）。 */
+  /** 从两张登记表摘除一条 pending。 */
   function dropEntry(rpcId: string, chatId: string): void {
     pendingQuestions.delete(rpcId)
     if (pendingQuestionByChat.get(chatId)?.rpcId === rpcId) pendingQuestionByChat.delete(chatId)
   }
 
-  /** question/requested 帧：反查 chat、发卡、登记（bridge.mjs handleQuestionRequested 1059）。 */
+  /** question/requested 帧：反查 chat、发卡、登记。 */
   async function handleQuestionRequested(frame: BridgeQuestionRequestedFrame, rpcId: string): Promise<void> {
     const { sessionId, questions } = frame
     const chatId = chatIdForSession(sessionId)
@@ -241,7 +238,7 @@ export function registerQuestions(runtime: QuestionRuntime): QuestionBridge {
     log(`question card sent: rpcId=${rpcId} chat=${chatId} q=${questions.length} cardId=${cardId}`)
   }
 
-  /** question/resolved 帧：host 已结算（回答或 agent 侧取消）——撤卡收尾（bridge.mjs 1087）。 */
+  /** question/resolved 帧：host 已结算（回答或 agent 侧取消）——撤卡收尾。 */
   async function handleQuestionResolved(frame: BridgeQuestionResolvedFrame): Promise<void> {
     const rpcId = frame.questionRpcId
     const entry = pendingQuestions.get(rpcId)
@@ -251,7 +248,7 @@ export function registerQuestions(runtime: QuestionRuntime): QuestionBridge {
     await finishQuestionCard(entry, frame.outcome === 'answered' ? 'answered' : 'cancelled')
   }
 
-  /** 消费自由文本，作为该 chat 最新 pending 卡里第一个未答的「无选项」问题答案（bridge.mjs 1099）。 */
+  /** 消费自由文本，作为该 chat 最新 pending 卡里第一个未答的「无选项」问题答案。 */
   async function answerPendingFreeText(chatId: string, text: string): Promise<boolean> {
     const entry = pendingQuestionByChat.get(chatId)
     if (entry === undefined) return false
@@ -273,9 +270,8 @@ export function registerQuestions(runtime: QuestionRuntime): QuestionBridge {
 
   /**
    * 结算一条 pending：摘表 + 用 `api.respond(ClientResponse)` 提交回答回 host
-   * （进程内直调，不走网络；bridge.mjs resolveQuestion 1120 的 fetch 版换成
-   * ctx.apiProxy.respond）。cancelled 分支修复 bridge 缺口：过期/卸载也通知
-   * host，避免 pending 永久悬挂。
+   * （进程内直调，不走网络）。cancelled 分支：过期/卸载也通知 host，避免
+   * pending 永久悬挂。
    */
   async function resolveQuestion(rpcId: string, outcome: 'answered' | 'cancelled'): Promise<void> {
     const api = ctx.get('apiProxy') as BridgeApiProxy | undefined
@@ -318,12 +314,12 @@ export function registerQuestions(runtime: QuestionRuntime): QuestionBridge {
     }
   }
 
-  /** 批次里每个问题是否都已记录至少一个答案（bridge.mjs allQuestionsAnswered 1155）。 */
+  /** 批次里每个问题是否都已记录至少一个答案。 */
   function allQuestionsAnswered(entry: PendingQuestionEntry): boolean {
     return entry.questions.every((_q, qIndex) => entry.answerMap.has(qIndex))
   }
 
-  /** 把当前选择状态渲染回 pending 卡；answered=true 时禁用全部交互元素（bridge.mjs 1162）。 */
+  /** 把当前选择状态渲染回 pending 卡；answered=true 时禁用全部交互元素。 */
   async function updateQuestionCard(entry: PendingQuestionEntry, answered = false): Promise<void> {
     const elements: object[] = []
     entry.questions.forEach((q, qIndex) => {
@@ -377,7 +373,7 @@ export function registerQuestions(runtime: QuestionRuntime): QuestionBridge {
     await updateCardkit(entry.cardId, { schema: '2.0', config: { update_multi: true }, body: { elements } })
   }
 
-  /** 结算一张卡：禁用按钮并标记 answered/cancelled，卡留在聊天历史（bridge.mjs 1263）。 */
+  /** 结算一张卡：禁用按钮并标记 answered/cancelled，卡留在聊天历史。 */
   async function finishQuestionCard(entry: PendingQuestionEntry, status: 'answered' | 'cancelled'): Promise<void> {
     try {
       await updateQuestionCard(entry, true)
@@ -388,7 +384,7 @@ export function registerQuestions(runtime: QuestionRuntime): QuestionBridge {
     }
   }
 
-  /** 卡片按钮回调路由：ask/askm/asksubmit 三种 value（bridge.mjs 1217 起的内联路由）。 */
+  /** 卡片按钮回调路由：ask/askm/asksubmit 三种 value。 */
   async function onCardAction(evt: CardActionEvent): Promise<void> {
     try {
       const value = evt?.action?.value
@@ -469,7 +465,7 @@ export function registerQuestions(runtime: QuestionRuntime): QuestionBridge {
     started = true
     disposers.push(channel.on('cardAction', onCardAction))
     disposers.push(() => ac.abort())
-    // 过期回收：撤卡 + 向 host 提交 cancelled（bridge 原缺口：只撤卡不发 cancelled）。
+    // 过期回收：撤卡 + 向 host 提交 cancelled。
     const reaper = setInterval(() => {
       const now = Date.now()
       const expired: Array<[string, PendingQuestionEntry]> = []
@@ -527,7 +523,7 @@ export function registerQuestions(runtime: QuestionRuntime): QuestionBridge {
   return { dispose, answerPendingFreeText }
 }
 
-/** 构建一张 ask 批次的交互卡：标题/说明 + 按钮单选或勾选多选 + 可选确认（bridge.mjs questionCard 970）。 */
+/** 构建一张 ask 批次的交互卡：标题/说明 + 按钮单选或勾选多选 + 可选确认。 */
 function questionCard(frame: BridgeQuestionRequestedFrame, rpcId: string): object {
   const elements: object[] = []
   const qs = frame.questions ?? []

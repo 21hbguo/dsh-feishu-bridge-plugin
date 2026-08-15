@@ -1,27 +1,22 @@
 /**
- * 工具调用审批卡片系统（进程内版，与 src/questions.ts 的 M18 提问卡片同构）。
+ * 工具调用审批卡片系统（进程内版，与 src/questions.ts 的提问卡片同构）。
  *
  * agent 回合内工具调用被审批策略挂起时（tools/pre-execute `{kind:'ask'}` →
- * ctx.approval.request），host 侧 api-proxy 的 approval answerer 为请求 mint
- * rpcId 并推送 `approval/requested` 帧到 events.mux（api-proxy.ts:1422-1488，
- * 帧定义 api/events.ts:72，信封 api/rpc.ts:171-176）；本模块独立订阅一条 mux 流
- * （与 questions.ts 的订阅互不干扰），按 `chatIdForSession` 反查飞书 chat，渲染
- * 「✅ 允许一次 / 🚫 拒绝」审批卡；用户点按钮后用
- * `ctx.apiProxy.respond(ClientResponse)` 把决定提交回 host
- * （api-proxy.ts:3699-3710，成功载荷见 api/approvals.ts:17-20）。host 结算后
- * 广播 `approval/resolved` 帧（api/events.ts:73，**无 rpcId**）——本模块按
- * approvalId 维护映射撤卡/禁用按钮。
+ * ctx.approval.request），host 侧为请求 mint rpcId 并推送 `approval/requested`
+ * 帧到 events.mux；本模块独立订阅一条 mux 流（与 questions.ts 的订阅互不干扰），
+ * 按 `chatIdForSession` 反查飞书 chat，渲染「✅ 允许一次 / 🚫 拒绝」审批卡；用户
+ * 点按钮后用 `ctx.apiProxy.respond(ClientResponse)` 把决定提交回 host。host 结算
+ * 后广播 `approval/resolved` 帧（**无 rpcId**）——本模块按 approvalId 维护映射
+ * 撤卡/禁用按钮。
  *
  * 与 questions.ts 的差异：
  * 1. 帧类型为 approval/requested|resolved（非 question/*）；resolved 帧不带
  *    rpcId，故 pending 登记键用 approvalId（按钮 value 即编码 approvalId）。
  * 2. 客户端不可提交 cancelled（ApprovalResponsePayload.outcome 只收
- *    allowed-once|rejected，approvals.ts:17-20、schema:20）→ 过期只撤卡 + log，
- *    不向 host 提交任何东西；host 侧 pending 由 agent 侧 abort 结算
- *    'cancelled'（api-proxy.ts:1419-1421、1470-1473）。
+ *    allowed-once|rejected）→ 过期只撤卡 + log，不向 host 提交任何东西；host 侧
+ *    pending 由 agent 侧 abort 结算 'cancelled'。
  * 3. mux 流意外结束时带退避重新订阅：断线重连后 host 以同 rpcId 重放仍 pending
- *    的 approval/requested 帧（api-proxy.ts:3447），已登记的 approvalId 跳过防
- *    重复发卡。
+ *    的 approval/requested 帧，已登记的 approvalId 跳过防重复发卡。
  *
  * 接线（由 index.ts 统一做，本文件不 import index.ts）：apply 的 effect 内调用
  * `registerApproval({ ctx, channel, chatIdForSession, log })`，把返回的 `dispose`
@@ -40,8 +35,7 @@ const MUX_RETRY_MS = 2000
 
 // ---------------------------------------------------------------------------
 // apiproxy 契约的进程内视图（结构镜像，不 import @deepseek-ai/dsh-host-apiproxy
-// —— 未声明的依赖；取值自 api/events.ts:69-75、api/rpc.ts:179-193、
-// api/approvals.ts:17-20、api-proxy.ts:3699-3710、3447）
+// —— 未声明的依赖）
 // ---------------------------------------------------------------------------
 
 /** 审批按钮回调 value 编码：`appr|<approvalId>|allow|reject`（含 approvalId 与 outcome）。 */
@@ -49,7 +43,7 @@ function approvalButtonValue(approvalId: string, outcome: 'allow' | 'reject'): s
   return `appr|${approvalId}|${outcome}`
 }
 
-/** 审批请求帧载荷（api/events.ts:72 镜像）。 */
+/** 审批请求帧载荷。 */
 interface BridgeApprovalRequestedFrame {
   type: 'approval/requested'
   sessionId: string
@@ -59,7 +53,7 @@ interface BridgeApprovalRequestedFrame {
   reason?: string
 }
 
-/** 审批已结算帧载荷（api/events.ts:73 镜像；无 rpcId）。 */
+/** 审批已结算帧载荷（无 rpcId）。 */
 interface BridgeApprovalResolvedFrame {
   type: 'approval/resolved'
   sessionId: string
@@ -79,7 +73,7 @@ interface BridgeMuxPayload {
   [key: string]: unknown
 }
 
-/** 审批应答 ClientResponse 信封（api/rpc.ts:179-183 镜像；成功载荷 api/approvals.ts:17-20）。 */
+/** 审批应答 ClientResponse 信封。 */
 interface BridgeApprovalClientResponse {
   type: 'client-response'
   rpcId: string
@@ -89,10 +83,10 @@ interface BridgeApprovalClientResponse {
   }
 }
 
-/** RpcReceipt（api/rpc.ts:193 镜像）。 */
+/** RpcReceipt。 */
 type BridgeRpcReceipt = { accepted: true } | { accepted: false; reason: 'not-pending' | 'bad-response' }
 
-/** ApiProxy 的进程内视图：只取 events.mux + respond 两个面（api/index.ts:22-42）。 */
+/** ApiProxy 的进程内视图：只取 events.mux + respond 两个面。 */
 interface BridgeApiProxy {
   events: {
     mux(request: { rpcId: string; payload: Record<string, unknown> }, signal: AbortSignal): AsyncIterable<{ rpcId: string; payload: BridgeMuxPayload }>
@@ -123,7 +117,7 @@ export interface ApprovalBridge {
 /** 一张 pending 审批卡的本地登记（键 = approvalId，resolved 帧无 rpcId 故不用 rpcId 作键）。 */
 interface PendingApprovalEntry {
   approvalId: string
-  /** host mint 的稳定 server-request id：respond 必须回显（api/rpc.ts:171-176）。 */
+  /** host mint 的稳定 server-request id：respond 必须回显。 */
   rpcId: string
   sessionId: string
   toolName: string
@@ -173,10 +167,10 @@ function statusLabel(status: ApprovalCardStatus): string {
  * 路由 appr/*；approval/resolved → 撤卡；10 分钟过期 reaper（撤卡 + log，不提交
  * host）；mux 流意外结束带退避重新订阅（重放帧按 approvalId 去重）。
  *
- * apiProxy 服务可能晚于本插件装配（web-app bundle 顺序不定）：先即时尝试，若
- * 未就绪则等 loader.await() 后再试一次；两种情况下都没有 apiProxy 就静默降级
- * （审批卡片功能关闭，插件其余功能不受影响）。不注册 ctx.approval answerer——
- * 会与 api-proxy 的 answerer 抢终态（waterfall 认领即抢走 web GUI 审批卡）。
+ * apiProxy 服务可能晚于本插件装配：先即时尝试，若未就绪则等 loader.await() 后
+ * 再试一次；两种情况下都没有 apiProxy 就静默降级（审批卡片功能关闭，插件其余
+ * 功能不受影响）。不注册 ctx.approval answerer——避免与宿主自带的 answerer 抢
+ * 终态（waterfall 认领会抢走 web GUI 审批卡）。
  */
 export function registerApproval(runtime: ApprovalRuntime): ApprovalBridge {
   const { ctx, channel, chatIdForSession, isYolo, log } = runtime
@@ -236,8 +230,8 @@ export function registerApproval(runtime: ApprovalRuntime): ApprovalBridge {
 
   /**
    * 结算一条 pending：摘表 + 用 `api.respond(ClientResponse)` 提交决定回 host
-   * （进程内直调，不走网络；api-proxy.ts:3699-3710）。outcome 只收
-   * allowed-once|rejected——客户端没有 cancelled 分支。
+   * （进程内直调，不走网络）。outcome 只收 allowed-once|rejected——客户端没有
+   * cancelled 分支。
    * @param keepRegistered - true 时保留 pending 登记（YOLO 自动放行用：重放帧按
    *   approvalId 去重、resolved 帧到达时正常清理；默认 false 与既有卡片路径一致）。
    */
@@ -389,8 +383,8 @@ export function registerApproval(runtime: ApprovalRuntime): ApprovalBridge {
       if (!ac.signal.aborted) log('approval mux stream ended:', errorMessage(error))
     }
     // 流意外结束（非主动中止）：退避后重新订阅；host 会以同 rpcId 重放仍 pending
-    // 的 approval/requested 帧（api-proxy.ts:3447），handleApprovalRequested 按
-    // approvalId 去重，不会重复发卡。
+    // 的 approval/requested 帧，handleApprovalRequested 按 approvalId 去重，
+    // 不会重复发卡。
     if (!ac.signal.aborted && !disposed) {
       retryTimer = setTimeout(() => {
         retryTimer = undefined
@@ -406,7 +400,7 @@ export function registerApproval(runtime: ApprovalRuntime): ApprovalBridge {
     disposers.push(channel.on('cardAction', onCardAction))
     disposers.push(() => ac.abort())
     // 过期回收：只撤卡 + log，不向 host 提交（客户端无 cancelled 分支；host 侧
-    // pending 由 agent 侧 abort 结算 'cancelled'，api-proxy.ts:1470-1473）。
+    // pending 由 agent 侧 abort 结算 'cancelled'）。
     const reaper = setInterval(() => {
       const now = Date.now()
       const expired: PendingApprovalEntry[] = []

@@ -1,10 +1,10 @@
 /**
- * Pure text helpers ported from bridge.mjs M10: @-mention stripping,
- * over-length truncation, and compact token-count formatting.
+ * Pure text helpers: @-mention stripping, over-length truncation, and compact
+ * token-count formatting.
  */
 import type { NormalizedMessage } from '@larksuiteoapi/node-sdk'
 
-/** Strip every @-mention key from a message body (bridge.mjs stripMentions). */
+/** Strip every @-mention key from a message body. */
 export function stripMentions(msg: NormalizedMessage): string {
   let text = msg.content ?? ''
   for (const m of msg.mentions ?? []) {
@@ -13,7 +13,7 @@ export function stripMentions(msg: NormalizedMessage): string {
   return text.trim()
 }
 
-/** Truncate an over-long reply with a trailing notice (bridge.mjs truncate). */
+/** Truncate an over-long reply with a trailing notice. */
 export function truncate(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text
   return `${text.slice(0, maxChars)}\n\n…(回复过长已截断)`
@@ -27,7 +27,7 @@ export function formatTokens(n: number): string {
   return `${scaled(n / 1_000_000)}M`
 }
 
-/** One-line whitespace-collapsed excerpt, capped (bridge.mjs excerpt). */
+/** One-line whitespace-collapsed excerpt, capped. */
 export function excerpt(s: string, max = 60): string {
   const t = (s ?? '').replace(/\s+/g, ' ').trim()
   return t === '' ? '' : t.length > max ? `${t.slice(0, max)}…` : t

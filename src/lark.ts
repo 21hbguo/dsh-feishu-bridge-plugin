@@ -1,7 +1,7 @@
 /**
- * Feishu channel factory (bridge.mjs M4): WebSocket long connection with the
- * dedup / chat-queue / stale-window safety settings and the streaming-card
- * throttle knobs, wired from the plugin Config.
+ * Feishu channel factory: WebSocket long connection with the dedup /
+ * chat-queue / stale-window safety settings and the streaming-card throttle
+ * knobs, wired from the plugin Config.
  */
 import { createLarkChannel, LoggerLevel, type LarkChannel, type LarkChannelOptions } from '@larksuiteoapi/node-sdk'
 
@@ -13,7 +13,7 @@ export interface LarkChannelSettings {
   streamThrottleChars: number
 }
 
-/** Build the channel exactly as bridge.mjs did (transport websocket, source tag, safety/policy/outbound). */
+/** Build the channel (transport websocket, source tag, safety/policy/outbound). */
 export function buildChannel(settings: LarkChannelSettings): LarkChannel {
   const options: LarkChannelOptions = {
     appId: settings.appId,
