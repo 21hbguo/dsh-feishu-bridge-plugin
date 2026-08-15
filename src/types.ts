@@ -47,6 +47,7 @@ export type BridgeSessionEvent =
   | { type: 'assistant/chunk'; data: { turn: number; step: number; chunk: { type: string; text?: string } } }
   | { type: 'assistant/message'; data: { turn: number; step: number; message: { content?: BridgeContentBlock[] }; usage?: BridgeTokenUsage } }
   | { type: 'turn/end'; data: { turn: number; reason: BridgeTurnEndReason } }
+  | { type: 'tool/call'; data: { turn: number; step: number; name: string } }
 
 /** Detached session header (mirror of dsh-session SessionHeader). */
 export interface BridgeSessionHeader {

@@ -346,12 +346,15 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
    * One in-process turn: ensure the agent, subscribe to its session events,
    * followup/steer the message, settle at turn/end (bridge.mjs thinkWeb).
    * @param mode - 'queue' waits for the current turn; 'steer' injects into it.
+   * @param onStatus - optional live progress callback (tool calls) so multi-step
+   * turns show activity on the streaming card instead of a static "思考中".
    */
   async function thinkTurn(
     chatId: string,
     text: string,
     onChunk?: (delta: string) => void,
     mode: 'queue' | 'steer' = 'queue',
+    onStatus?: (toolName: string) => void,
   ): Promise<{ text: string; interrupted: boolean; blocked: boolean }> {
     const sessionId = sessionIdForChat(chatId)
     const agent = await ensureAgent(chatId, sessionId)
@@ -399,6 +402,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
               collected.push({ turn: ev.data.turn, delta })
               try { onChunk?.(delta) } catch { /* stream best-effort */ }
             }
+          } else if (ev.type === 'tool/call' && !entry.interrupted) {
+            try { onStatus?.(ev.data.name) } catch { /* status best-effort */ }
           } else if (ev.type === 'turn/end') {
             if (timer !== undefined) clearTimeout(timer)
             unsub()
@@ -513,8 +518,11 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
       const { messageId } = await channel.stream(msg.chatId, {
         markdown: async (controller) => {
           const onChunk = (delta: string) => { void controller.append(delta).catch(() => {}) }
+          const onStatus = (toolName: string) => {
+            void controller.append(`\n\n> 🔧 正在调用工具：${toolName}…`).catch(() => {})
+          }
           try {
-            const result = await thinkTurn(msg.chatId, text, onChunk, mode)
+            const result = await thinkTurn(msg.chatId, text, onChunk, mode, onStatus)
             streamed = result.text
             interrupted = result.interrupted
             blocked = result.blocked
