@@ -258,9 +258,12 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
       ? (ctx.get('workspaceRegistry') as BridgeWorkspaceRegistry | undefined)?.get(workspaceId)
       : undefined
     const cwd = workspace?.path ?? process.cwd()
+    // Follow the deployment's default agent preset (settings agent-presets.default),
+    // falling back to the standard preset when the roster is not mounted.
+    const presetId = (ctx.get('agentPresets') as { defaultId: string } | undefined)?.defaultId ?? 'standard'
     const { agent } = await agents.create({
       sessionId,
-      meta: { cwd, agentPreset: 'standard' },
+      meta: { cwd, agentPreset: presetId },
       ...(agentOptions === undefined ? {} : { agentOptions }),
     })
     if (workspace !== undefined) {
