@@ -16,6 +16,7 @@
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk'
 import type { Context } from 'cordis'
 import { firstSentence, formatTokens } from './text.js'
+import { currentEffort, installEffortPref, supportedEfforts } from './effort.js'
 import type {
   BridgeAgent,
   BridgeAgentRegistry,
@@ -55,6 +56,8 @@ export interface CommandRuntime {
   /** Per-chat YOLO 免审批开关（/yolo 设置；内存态，重启自动关闭，不持久化）。 */
   chatYoloPrefs: Map<string, boolean>
   chatModelPrefs: Map<string, BridgeModelPreference>
+  /** Per-chat thinking-effort preference set by /effort; applied on the next turn (persisted). */
+  chatEffortPrefs: Map<string, string>
   chatTranscript: Map<string, BridgeTranscriptEntry[]>
   log(...args: unknown[]): void
   cmdReply(msg: NormalizedMessage, text: string): Promise<void>
@@ -281,6 +284,9 @@ async function ensureResumable(runtime: CommandRuntime, chatId: string, sessionI
   await agents.resume({
     resumeSessionId: sessionId,
     ...(agentOptions === undefined ? {} : { agentOptions }),
+    // Effort preference rides an agent-scoped agent/request waterfall (see
+    // src/effort.ts), same registration the index.ts create/resume path uses.
+    setup: (agentCtx) => { installEffortPref(agentCtx, () => runtime.chatEffortPrefs.get(chatId)) },
   })
 }
 
@@ -503,6 +509,38 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
         runtime.chatModelPrefs.set(msg.chatId, pref)
         applyModelToLiveAgent(runtime, msg.chatId, pref)
         await cmdReply(msg, `✅ 已切换模型：${entry.model}（${entry.providerName ?? entry.provider}），下一回合生效（记忆保留）。`)
+      },
+    },
+    effort: {
+      desc: '查看/切换思考强度：/effort 或 /effort <档位>',
+      async run(msg, arg) {
+        const target = arg.trim()
+        // 当前值 = per-chat 偏好优先，否则运行时实际值（reasoningEffort 读取）。
+        const current = await currentEffort(runtime, msg.chatId)
+        const route = currentModel(runtime, msg.chatId)
+        const efforts = await supportedEfforts(runtime.ctx, route)
+        if (target === '') {
+          const label = current ?? '—'
+          if (efforts === null) {
+            // 未知适配器：只显示实际值，不编造档位列表。
+            await cmdReply(msg, `🧠 当前思考强度: ${label}\n（该模型的适配器未暴露档位列表，无法枚举；/effort <档位> 仍可尝试切换）`)
+            return
+          }
+          const lines = [`🧠 思考强度档位（当前: ${label}）：`]
+          lines.push(...efforts.map((e) => `• ${e}${e === current ? ' ← 当前' : ''}`))
+          const provider = route?.provider !== undefined && route.provider !== '' ? route.provider : '当前模型'
+          lines.push(`（该列表来自 ${provider} 的适配器；/effort <档位> 切换，下一回合生效）`)
+          await cmdReply(msg, lines.join('\n'))
+          return
+        }
+        // 档位在支持列表内才接受；枚举不到列表（未知模型）时宽松接受任意非空值，防误伤。
+        if (efforts !== null && !efforts.includes(target)) {
+          await cmdReply(msg, `⚠️ 档位 ${target} 不在支持列表（${efforts.join(' / ')}）。\n输入 /effort 查看当前支持的档位。`)
+          return
+        }
+        runtime.chatEffortPrefs.set(msg.chatId, target)
+        runtime.persist()
+        await cmdReply(msg, `✅ 思考强度已切换为 ${target}（下一回合生效）。`)
       },
     },
     stream: {
