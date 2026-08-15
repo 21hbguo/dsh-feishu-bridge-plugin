@@ -6,11 +6,13 @@
  * 串行队列与插队、看门狗（超时 cancel + 错误卡片，**不退出进程**）、@提及剥离/
  * 截断/token 格式化、handle 入口、斜杠命令子集。
  *
- * 明确不做：RUNTIME=local 模式、任何 UI/client 代码与模型工具注册。
+ * 明确不做：RUNTIME=local 模式、任何 UI/client 代码。模型工具注册仅限
+ * feishu_setup 一个（一键扫码配置，见 src/setup.ts）；注册失败只告警不阻塞。
  * 提问/问答卡片系统见 src/questions.ts（进程内 api.respond，不注册 userQuestions
  * provider）；/workspace /model /resume 命令见 src/commands.ts。
  */
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk'
 import type { Context } from 'cordis'
 import z from 'schemastery'
@@ -19,6 +21,7 @@ import { registerApproval } from './approval.js'
 import { registerCommands, renderStatus, type CommandRuntime } from './commands.js'
 import { registerQuestions } from './questions.js'
 import { buildChannel } from './lark.js'
+import { beginSetupFlow, loadCredentials, saveCredentials, setupErrorMessage, type SetupFlow } from './setup.js'
 import { loadState, saveState, sessionIdFor, type BridgeState } from './state.js'
 import { formatTokens, stripMentions, truncate } from './text.js'
 import type {
@@ -79,42 +82,160 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/** Bridge-wide log line for apply-scope code (createRuntime keeps its own copy). */
+function log(...args: unknown[]): void {
+  console.error(`[${name} ${new Date().toISOString().slice(11, 19)}]`, ...args)
+}
+
+/** Cross-generation bridge hooks handed into each runtime generation (see apply). */
+interface BridgeHooks {
+  /** Claim a fresh QR setup flow; null when one is already running. */
+  startSetup(): SetupFlow | null
+  /** Swap the bridge onto fresh credentials: tear down + rebuild + reconnect. */
+  rebuildChannel(appId: string, appSecret: string): Promise<void>
+}
+
 export function apply(ctx: Context, config: Config): void {
-  // Credentials: Config wins, environment as fallback.
-  const appId = config.feishuAppId !== '' ? config.feishuAppId : (process.env.FEISHU_APP_ID ?? '')
-  const appSecret = config.feishuAppSecret !== '' ? config.feishuAppSecret : (process.env.FEISHU_APP_SECRET ?? '')
+  // Credentials: Config wins, environment second, persisted credentials.json last.
+  const saved = loadCredentials()
+  const appId = config.feishuAppId !== '' ? config.feishuAppId : (process.env.FEISHU_APP_ID ?? saved?.appId ?? '')
+  const appSecret = config.feishuAppSecret !== '' ? config.feishuAppSecret : (process.env.FEISHU_APP_SECRET ?? saved?.appSecret ?? '')
   if (appId === '' || appSecret === '') {
     throw new Error(`${name}: FEISHU_APP_ID / FEISHU_APP_SECRET are required (Config or environment)`)
   }
-  const channel = buildChannel({
-    appId,
-    appSecret,
-    streamThrottleMs: config.streamThrottleMs,
-    streamThrottleChars: config.streamThrottleChars,
-  })
-  const runtime = createRuntime(ctx, channel, config, appId)
-  // One effect owns the whole bridge lifetime: channel listeners, the global
-  // session/event feed, the (re)connect loop, and the teardown disposer.
+
+  // One effect owns the whole bridge lifetime: the current bridge generation
+  // (channel + runtime + channel listeners), the global session/event feed,
+  // the (re)connect loop, the credential-swap path (startSetup /
+  // rebuildChannel, shared by /setup and the feishu_setup tool), and the
+  // teardown disposer.
   ctx.effect(() => {
     const offs: Array<() => void> = []
+    let disposed = false
+
+    interface BridgeInstance {
+      channel: LarkChannel
+      runtime: BridgeRuntime
+      dispose(): void
+    }
+    let bridge: BridgeInstance | null = null
+
+    // The session/event feed is generation-independent: it always dispatches
+    // into the CURRENT runtime, so a credential swap rebuilds cleanly.
     offs.push(ctx.on('session/event', (session, event) => {
       if (!session.id.startsWith('feishu-')) return
-      runtime.onGlobalSessionEvent(session.id, event)
+      bridge?.runtime.onGlobalSessionEvent(session.id, event as BridgeSessionEvent)
     }))
-    offs.push(channel.on('error', (err) => runtime.log('channel error:', err.code, err.message)))
-    offs.push(channel.on('reconnecting', () => runtime.log('channel reconnecting…')))
-    offs.push(channel.on('reconnected', () => runtime.log('channel reconnected')))
-    offs.push(channel.on('message', (msg) => {
-      void runtime.handle(msg).catch((error) => runtime.log('message handling failed:', errorMessage(error)))
-    }))
-    void runtime.connectChannel()
+
+    /** Build + wire + connect a new bridge generation from fresh credentials. */
+    function startBridge(nextAppId: string, nextAppSecret: string): void {
+      if (disposed) return
+      bridge?.dispose()
+      const channel = buildChannel({
+        appId: nextAppId,
+        appSecret: nextAppSecret,
+        streamThrottleMs: config.streamThrottleMs,
+        streamThrottleChars: config.streamThrottleChars,
+      })
+      const runtime = createRuntime(ctx, channel, config, nextAppId, { startSetup, rebuildChannel })
+      const channelOffs: Array<() => void> = []
+      channelOffs.push(channel.on('error', (err) => runtime.log('channel error:', err.code, err.message)))
+      channelOffs.push(channel.on('reconnecting', () => runtime.log('channel reconnecting…')))
+      channelOffs.push(channel.on('reconnected', () => runtime.log('channel reconnected')))
+      channelOffs.push(channel.on('message', (msg) => {
+        void runtime.handle(msg).catch((error) => runtime.log('message handling failed:', errorMessage(error)))
+      }))
+      bridge = {
+        channel,
+        runtime,
+        dispose: () => {
+          for (const off of channelOffs) {
+            try { off() } catch { /* already gone */ }
+          }
+          runtime.dispose()
+        },
+      }
+      void runtime.connectChannel()
+    }
+
+    /** Credential swap: dispose the old generation, rebuild + reconnect. */
+    async function rebuildChannel(nextAppId: string, nextAppSecret: string): Promise<void> {
+      log('feishu bridge rebuilding with new credentials:', nextAppId)
+      startBridge(nextAppId, nextAppSecret)
+    }
+
+    // ------------------------------------------------------------ setup flow
+    let activeSetup: SetupFlow | null = null
+
+    /** Claim a fresh setup flow; null while one is already running (per process). */
+    function startSetup(): SetupFlow | null {
+      if (activeSetup !== null) return null
+      const flow = beginSetupFlow({
+        onStatusChange: (info) => log('feishu setup status:', JSON.stringify(info)),
+      })
+      activeSetup = flow
+      const release = (): void => { if (activeSetup === flow) activeSetup = null }
+      void flow.result.then(release, release)
+      return flow
+    }
+
+    /** Background finalize after the user scans: save credentials + rebuild. */
+    function runBackgroundSetup(flow: SetupFlow): void {
+      void flow.result.then(async (result) => {
+        try {
+          saveCredentials(result)
+          await rebuildChannel(result.appId, result.appSecret)
+        } catch (error) {
+          log('feishu setup finalize failed:', errorMessage(error))
+        }
+      }, (error) => {
+        log('feishu setup failed:', setupErrorMessage(error))
+      })
+    }
+
+    // ------------------------------------------------------------ DSH tool entry
+    // feishu_setup：生成授权链接（返回 URL 文本），后台等待授权完成后自动写
+    // 凭据并重建飞书连接。tools 服务未装配（可选 peer）时只告警，不阻塞桥本身。
+    const toolRuntime = ctx.get('tools') as { register(tool: ToolDefinition): () => void } | undefined
+    if (toolRuntime?.register !== undefined) {
+      try {
+        offs.push(toolRuntime.register(defineTool({
+          name: 'feishu_setup',
+          description: '生成飞书授权链接，扫码后自动配置飞书桥凭据',
+          parameters: {},
+          output: {
+            schema: { type: 'string' },
+            render: (_args, value: string) => [{ type: 'text', text: value }],
+          },
+          timeoutMs: 120_000,
+          async execute() {
+            const flow = startSetup()
+            if (flow === null) return '⚠️ 已有配置流程在进行中，请等待其完成。'
+            try {
+              const info = await flow.qrReady
+              runBackgroundSetup(flow)
+              return `🔗 请打开链接并用飞书扫码授权（${info.expireIn} 秒内有效）：\n${info.url}\n\n授权完成后将自动写入凭据并重连飞书，无需其他操作。`
+            } catch (error) {
+              return `❌ ${setupErrorMessage(error)}`
+            }
+          },
+        })))
+      } catch (error) {
+        log('feishu_setup tool registration failed:', errorMessage(error))
+      }
+    }
+
+    startBridge(appId, appSecret)
+
     return () => {
+      disposed = true
+      try { activeSetup?.abort() } catch { /* already gone */ }
       for (const off of offs) {
         try { off() } catch { /* already gone */ }
       }
-      runtime.dispose()
+      bridge?.dispose()
     }
-  }, `${name}: channel + session events`)
+  }, `${name}: channel + session events + setup tool`)
 }
 
 /** Public surface of the bridge runtime, consumed by the apply effect. */
@@ -126,7 +247,7 @@ interface BridgeRuntime {
   dispose(): void
 }
 
-function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId: string): BridgeRuntime {
+function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId: string, hooks: BridgeHooks): BridgeRuntime {
   // ------------------------------------------------------------ persistent state
   const state: BridgeState = loadState()
   const chatEpochs = new Map(Object.entries(state.chatEpochs))
@@ -865,6 +986,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     agentPreset,
     reasoningEffort,
     restartChannel,
+    startSetup: hooks.startSetup,
+    rebuildChannel: hooks.rebuildChannel,
   }
   const runCommand = registerCommands(commandRuntime).runCommand
 
