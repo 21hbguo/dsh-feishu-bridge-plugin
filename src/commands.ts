@@ -160,10 +160,21 @@ function latestAnswer(events: readonly BridgeLogEvent[]): string {
   return latestAssistantAnswers(events, 1)[0] ?? ''
 }
 
+/** Last event timestamp of a session log (the honest "last active" time), 0 when unknown. */
+function latestEventTime(events: readonly BridgeLogEvent[]): number {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const t = events[i]?.time
+    if (t !== undefined && t > 0) return t
+  }
+  return 0
+}
+
 /** One /resume candidate row. */
 interface ResumeRow {
   epoch: string
   createdAt: number
+  /** Last event timestamp (last active time); falls back to createdAt. */
+  updatedAt: number
   running: boolean
   sessionId: string
   summary: string
@@ -243,6 +254,7 @@ async function recentSessions(runtime: CommandRuntime, chatId: string): Promise<
     return {
       epoch: epochOf(sessionId),
       createdAt: row.createdAt,
+      updatedAt: latestEventTime(events ?? []) || row.createdAt,
       running: row.running,
       sessionId,
       summary: latestAnswer(events ?? []),
@@ -334,9 +346,13 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
       desc: '清空本会话记忆（开新 DSH 会话）',
       async run(msg) {
         const next = nextEpoch(runtime, msg.chatId)
+        // Clear the session override BEFORE any persist: appendEpoch persists
+        // synchronously, so deleting after it left a stale web-session binding
+        // in state.json (survives reloads/restarts) — the /new escape hatch
+        // silently failed. (f4c1642 regression)
+        runtime.chatSessionOverride.delete(msg.chatId)
         runtime.chatEpochs.set(msg.chatId, next)
         runtime.appendEpoch(msg.chatId, next)
-        runtime.chatSessionOverride.delete(msg.chatId)
         await cmdReply(msg, '✅ 已重置本会话记忆，开始新的 DSH 会话。')
       },
     },
@@ -497,8 +513,8 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
           if (recent.length === 0) { await cmdReply(msg, '本对话还没有历史会话。'); return }
           const lines = [`📁 当前工作区：${workspaceLabel(runtime, msg.chatId)}`, '']
           lines.push(...recent.map((s, i) => {
-            const when = s.createdAt > 0
-              ? new Date(s.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+            const when = s.updatedAt > 0
+              ? new Date(s.updatedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
               : '—'
             const excerpt = s.summary.replace(/\s+/g, ' ').trim()
             const label = excerpt !== '' ? `「${excerpt.length > 40 ? `${excerpt.slice(0, 40)}…` : excerpt}」` : '（无内容）'

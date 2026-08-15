@@ -59,6 +59,8 @@ export interface BridgeSessionHeader {
 export interface BridgeLogEvent {
   type: string
   data: { message?: { content?: BridgeContentBlock[] } }
+  /** Event timestamp (epoch ms); present on real session events. */
+  time?: number
 }
 
 /** Minimal session handle (mirror of dsh-session Session). */

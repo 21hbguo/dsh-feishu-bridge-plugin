@@ -353,6 +353,16 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   ): Promise<{ text: string; interrupted: boolean; blocked: boolean }> {
     const sessionId = sessionIdForChat(chatId)
     const agent = await ensureAgent(chatId, sessionId)
+    // A session shared with the web GUI: when another driver is running its
+    // turn right now and the bridge did not start it, tell the user the
+    // message is queued instead of waiting silently (then timing out).
+    if (agent.status === 'running' && chatTurns.get(chatId) === undefined) {
+      try {
+        await channel.send(chatId, {
+          text: '⚠️ 该会话正在 web 端使用中，你的消息已排队，处理完当前回合后会自动回复。',
+        })
+      } catch { /* best-effort notice */ }
+    }
     const collected: string[] = []
     let blocked = false
     const entry: TurnEntry = {
@@ -371,9 +381,13 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     try {
       const done = new Promise<void>((resolve) => {
         // Cancel shortly before the queue watchdog so the turn settles via a
-        // normal turn/end instead of the watchdog firing mid-stream.
+        // normal turn/end instead of the watchdog firing mid-stream, then
+        // hard-settle even if the agent never emits turn/end (e.g. another
+        // driver holds the loop on a shared session): cleanup runs and the
+        // per-chat queue can never wedge on a silent turn.
         let timer: NodeJS.Timeout | undefined = setTimeout(() => {
           entry.cancel()
+          resolve()
         }, Math.max(10_000, config.maxTurnMs - 10_000))
         const unsub = onSessionEvent(sessionId, (ev) => {
           if (ev.type === 'assistant/chunk' && ev.data.chunk.type === 'text-delta') {
