@@ -2,7 +2,6 @@
   "name": "@dsh-external/dsh-feishu-bridge",
   "version": "0.0.1",
   "description": "飞书机器人 ↔ DSH 对话桥：进程内驱动 DSH 会话，流式卡片回复",
-  "private": true,
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/types/index.d.ts",
@@ -10,11 +9,35 @@
     "lib"
   ],
   "license": "BSD-3-Clause",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "feishu",
+    "lark",
+    "bot",
+    "plugin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/21hbguo/dsh-feishu-bridge-plugin.git"
+  },
+  "homepage": "https://github.com/21hbguo/dsh-feishu-bridge-plugin",
+  "bugs": {
+    "url": "https://github.com/21hbguo/dsh-feishu-bridge-plugin/issues"
+  },
   "peerDependencies": {
     "@deepseek-ai/dsh-llm": ">=0.0.1-rc <2",
     "@deepseek-ai/dsh-tools": ">=0.0.1-rc <2",
     "cordis": ">=4.0.0-rc <5",
     "schemastery": "^3.18.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
