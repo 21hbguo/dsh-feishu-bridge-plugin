@@ -6,6 +6,8 @@
 #   一条命令完成「下载最新 Release tgz → 解压到安装目录 → 装配进 DSH profile
 #   （dependencies 加 link: 条目 + dsh.profile.bundles 加包名）→ 建 node_modules
 #   软链」。装配完成后完全重启 DSH 即生效。
+#   tgz 资产名从 GitHub API（releases/latest）动态解析；API 不可用/限流时
+#   回退 <版本> 拼装资产名并给出警告，下载仍走 releases/latest/download 稳定链接。
 #
 # 用法:
 #   bash install.sh [--profile <名>] [--dir <目录>] [--skip-download] [TGZ_PATH]
@@ -28,8 +30,14 @@ set -euo pipefail
 
 # ---------- 常量 ----------
 PKG_NAME="@dsh-external/dsh-feishu-bridge"
-TGZ_NAME="dsh-external-dsh-feishu-bridge-0.0.1.tgz"
-RELEASE_URL="https://github.com/21hbguo/dsh-feishu-bridge-plugin/releases/latest/download/${TGZ_NAME}"
+# 资产名动态解析：优先从 GitHub API（releases/latest）取 .tgz 资产名；
+# 未认证 API 限流 60 次/小时，解析失败时回退 FALLBACK_VERSION 拼装并给出警告。
+# 下载仍走 releases/latest/download/<资产名> 稳定链接。
+RELEASE_API="https://api.github.com/repos/21hbguo/dsh-feishu-bridge-plugin/releases/latest"
+RELEASE_DL="https://github.com/21hbguo/dsh-feishu-bridge-plugin/releases/latest/download"
+FALLBACK_VERSION="0.0.2"
+FALLBACK_TGZ_NAME="dsh-external-dsh-feishu-bridge-${FALLBACK_VERSION}.tgz"
+TGZ_NAME=""
 PROFILES_DIR="${DSH_PROFILES_DIR:-$HOME/.dsh/profiles}"
 
 # ---------- 默认值 ----------
@@ -58,7 +66,7 @@ usage() {
 示例:
   bash install.sh
   bash install.sh --profile my-profile --dir /opt/dsh-plugins/feishu
-  bash install.sh --skip-download ./${TGZ_NAME}
+  bash install.sh --skip-download ./${FALLBACK_TGZ_NAME}
 
 支持平台: Linux / macOS。依赖: curl、tar、node。
 免责: 插件包从 GitHub Releases 下载（21hbguo/dsh-feishu-bridge-plugin），请确认来源可信。
@@ -68,6 +76,35 @@ EOF
 fail() {
   echo "错误: $*" >&2
   exit 1
+}
+
+# ---------- 资产名解析 ----------
+# 解析最新 Release 的 .tgz 资产名（GitHub API，未认证限流 60 次/小时）。
+# 成功写入全局 TGZ_NAME；失败回退 FALLBACK_TGZ_NAME 并输出警告（stderr）。
+resolve_asset_name() {
+  local json name
+  json="$(curl -fsSL --retry 2 --connect-timeout 15 --max-time 60 "$RELEASE_API" 2>/dev/null)" || {
+    echo "警告: 资产名解析失败（GitHub API 不可用或限流），已回退 ${FALLBACK_TGZ_NAME}，请确认 Release 资产名。" >&2
+    TGZ_NAME="$FALLBACK_TGZ_NAME"
+    return
+  }
+  name="$(printf '%s' "$json" | node -e '
+    let data = "";
+    process.stdin.on("data", (c) => { data += c; });
+    process.stdin.on("end", () => {
+      try {
+        const release = JSON.parse(data);
+        const asset = (release.assets || []).map((a) => a.name).find((n) => typeof n === "string" && n.endsWith(".tgz"));
+        process.stdout.write(asset || "");
+      } catch { /* 非 JSON（如限流提示页）→ 输出空，走回退 */ }
+    });
+  ' 2>/dev/null || true)"
+  if [ -n "$name" ]; then
+    TGZ_NAME="$name"
+  else
+    echo "警告: 资产名解析失败（API 返回异常或未找到 .tgz 资产），已回退 ${FALLBACK_TGZ_NAME}，请确认 Release 资产名。" >&2
+    TGZ_NAME="$FALLBACK_TGZ_NAME"
+  fi
 }
 
 # ---------- 1. 解析参数 ----------
@@ -169,9 +206,11 @@ if [ "$SKIP_DOWNLOAD" = "1" ]; then
   verify_tgz "$TGZ_PATH"
   tgz="$TGZ_PATH"
 else
+  resolve_asset_name
+  echo "已解析最新 Release 资产: $TGZ_NAME"
   tmp_tgz="$(mktemp "${TMPDIR:-/tmp}/dsh-feishu-bridge.XXXXXX")"
-  echo "下载 $RELEASE_URL"
-  curl -fsSL --retry 3 --connect-timeout 30 --max-time 600 -o "$tmp_tgz" "$RELEASE_URL" || {
+  echo "下载 $RELEASE_DL/$TGZ_NAME"
+  curl -fsSL --retry 3 --connect-timeout 30 --max-time 600 -o "$tmp_tgz" "$RELEASE_DL/$TGZ_NAME" || {
     code=$?
     fail "下载失败（curl 退出码 ${code:-?}）。请检查网络，或稍后重试；也可手动下载 tgz 后用 --skip-download 安装。"
   }
