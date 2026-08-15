@@ -48,6 +48,8 @@ export interface CommandRuntime {
   chatWorkspaces: Map<string, string>
   chatTurns: Map<string, BridgeTurnEntry>
   chatStreamPrefs: Map<string, boolean>
+  /** Per-chat YOLO 免审批开关（/yolo 设置；内存态，重启自动关闭，不持久化）。 */
+  chatYoloPrefs: Map<string, boolean>
   chatModelPrefs: Map<string, BridgeModelPreference>
   chatTranscript: Map<string, BridgeTranscriptEntry[]>
   log(...args: unknown[]): void
@@ -479,6 +481,16 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
         await cmdReply(msg, '♻️ 正在重连…')
         await runtime.restartChannel()
         await cmdReply(msg, '✅ 已重连。')
+      },
+    },
+    yolo: {
+      desc: '本会话免审批模式（自动放行工具审批）',
+      async run(msg, arg) {
+        const off = arg.trim().toLowerCase() === 'off'
+        runtime.chatYoloPrefs.set(msg.chatId, !off)
+        await cmdReply(msg, off
+          ? '🔒 YOLO 已关闭：审批卡片恢复。'
+          : '⚡ YOLO 已开启：本会话工具审批将自动放行，不再弹卡片。发送 /yolo off 关闭。')
       },
     },
   }

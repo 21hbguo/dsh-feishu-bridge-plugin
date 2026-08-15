@@ -108,6 +108,8 @@ export interface ApprovalRuntime {
   channel: LarkChannel
   /** 反查拥有某 DSH sessionId 的飞书 chat（与 questions.ts 同源，index.ts chatIdForSession）。 */
   chatIdForSession(sessionId: string): string | undefined
+  /** YOLO 免审批查询：true 时该 chat 的审批帧自动放行（不弹卡片；由 index.ts 提供）。 */
+  isYolo(chatId: string): boolean
   /** 日志（复用 runtime.log）。 */
   log(...args: unknown[]): void
 }
@@ -177,7 +179,7 @@ function statusLabel(status: ApprovalCardStatus): string {
  * 会与 api-proxy 的 answerer 抢终态（waterfall 认领即抢走 web GUI 审批卡）。
  */
 export function registerApproval(runtime: ApprovalRuntime): ApprovalBridge {
-  const { ctx, channel, chatIdForSession, log } = runtime
+  const { ctx, channel, chatIdForSession, isYolo, log } = runtime
 
   /** pendingApprovals: approvalId -> entry（键不用 rpcId，resolved 帧无 rpcId）。 */
   const pendingApprovals = new Map<string, PendingApprovalEntry>()
@@ -218,6 +220,11 @@ export function registerApproval(runtime: ApprovalRuntime): ApprovalBridge {
 
   /** 撤卡：禁用按钮 + 标记终态，卡留在聊天历史（与 questions.ts finishQuestionCard 同构）。 */
   async function finalizeApprovalCard(entry: PendingApprovalEntry, status: Exclude<ApprovalCardStatus, 'pending'>): Promise<void> {
+    if (entry.cardId === '') {
+      // YOLO 自动放行路径没有卡片：只记录终态，不更新 cardkit。
+      log(`approval settled without card (yolo): approvalId=${entry.approvalId} status=${status}`)
+      return
+    }
     try {
       await updateCardkit(entry.cardId, approvalCard(entry, status))
       log(`approval card finalized: msg=${entry.cardMessageId} status=${status}`)
@@ -231,10 +238,12 @@ export function registerApproval(runtime: ApprovalRuntime): ApprovalBridge {
    * 结算一条 pending：摘表 + 用 `api.respond(ClientResponse)` 提交决定回 host
    * （进程内直调，不走网络；api-proxy.ts:3699-3710）。outcome 只收
    * allowed-once|rejected——客户端没有 cancelled 分支。
+   * @param keepRegistered - true 时保留 pending 登记（YOLO 自动放行用：重放帧按
+   *   approvalId 去重、resolved 帧到达时正常清理；默认 false 与既有卡片路径一致）。
    */
-  async function resolveApproval(entry: PendingApprovalEntry, outcome: 'allowed-once' | 'rejected'): Promise<void> {
+  async function resolveApproval(entry: PendingApprovalEntry, outcome: 'allowed-once' | 'rejected', keepRegistered = false): Promise<void> {
     const api = ctx.get('apiProxy') as BridgeApiProxy | undefined
-    dropEntry(entry.approvalId)
+    if (!keepRegistered) dropEntry(entry.approvalId)
     if (api === undefined) {
       log(`approval resolve skipped (apiProxy unavailable): approvalId=${entry.approvalId} outcome=${outcome}`)
       return
@@ -271,6 +280,26 @@ export function registerApproval(runtime: ApprovalRuntime): ApprovalBridge {
     const chatId = chatIdForSession(sessionId)
     if (chatId === undefined) {
       log(`approval frame for unknown chat (session ${sessionId}) — skipping`)
+      return
+    }
+    if (isYolo(chatId)) {
+      // YOLO 免审批：不发卡片，直接回 allowed-once（rpcId 回显同现有逻辑）；
+      // 仍登记 pending（断线重放帧按 approvalId 去重、resolved 帧到达时正常清理），
+      // 并给 chat 回一条轻量文本（reason 过长截断）。
+      const entry: PendingApprovalEntry = {
+        approvalId, rpcId, sessionId, toolName, callId, reason, chatId,
+        cardMessageId: '', cardId: '',
+        expiresAt: Date.now() + APPROVAL_TTL_MS,
+      }
+      pendingApprovals.set(approvalId, entry)
+      log(`approval auto-allowed (yolo): approvalId=${approvalId} rpcId=${rpcId} chat=${chatId} tool=${toolName}`)
+      await resolveApproval(entry, 'allowed-once', true)
+      const reasonSuffix = reason !== undefined && reason !== '' ? `（${shorten(reason, 80)}）` : ''
+      try {
+        await channel.send(chatId, { text: `⚡ YOLO：已自动批准 ${toolName || '未知工具'}${reasonSuffix}` }, {})
+      } catch (error) {
+        log('approval yolo notice send failed:', errorMessage(error))
+      }
       return
     }
     const entry: PendingApprovalEntry = {

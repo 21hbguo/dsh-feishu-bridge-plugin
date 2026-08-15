@@ -529,6 +529,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   const chatQueuePrefs = new Map<string, boolean>()
   /** Per-chat model preference set by /model; applied on the next create/resume. */
   const chatModelPrefs = new Map<string, BridgeModelPreference>()
+  /** Per-chat YOLO 免审批开关（/yolo 设置；内存态，重启自动关闭，不持久化）。 */
+  const chatYoloPrefs = new Map<string, boolean>()
 
   /** Per-chat queue preference: true = queue, false/absent = steer (bridge.mjs messageMode). */
   function messageMode(chatId: string, forced: 'queue' | 'steer' | undefined): 'queue' | 'steer' {
@@ -702,6 +704,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     chatWorkspaces,
     chatTurns,
     chatStreamPrefs,
+    chatYoloPrefs,
     chatModelPrefs,
     chatTranscript,
     log,
@@ -727,7 +730,12 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   }
 
   const questions = registerQuestions({ ctx, channel, chatIdForSession, log })
-  const approvals = registerApproval({ ctx, channel, chatIdForSession, log })
+
+  /** YOLO 免审批查询：该 chat 开启 /yolo 后审批帧自动放行（approval.ts 消费）。 */
+  function isYolo(chatId: string): boolean {
+    return chatYoloPrefs.get(chatId) === true
+  }
+  const approvals = registerApproval({ ctx, channel, chatIdForSession, isYolo, log })
 
   // ------------------------------------------------------------ lifecycle (M19/M20 in-process)
   let connectRetryTimer: NodeJS.Timeout | undefined
