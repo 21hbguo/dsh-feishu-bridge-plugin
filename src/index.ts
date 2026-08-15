@@ -363,7 +363,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
         })
       } catch { /* best-effort notice */ }
     }
-    const collected: string[] = []
+    const collected: Array<{ turn: number; delta: string }> = []
+    let endedTurn = 0
     let blocked = false
     const entry: TurnEntry = {
       startedAt: Date.now(),
@@ -393,12 +394,13 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
           if (ev.type === 'assistant/chunk' && ev.data.chunk.type === 'text-delta') {
             const delta = ev.data.chunk.text
             if (delta !== undefined && delta !== '') {
-              collected.push(delta)
+              collected.push({ turn: ev.data.turn, delta })
               try { onChunk?.(delta) } catch { /* stream best-effort */ }
             }
           } else if (ev.type === 'turn/end') {
             if (timer !== undefined) clearTimeout(timer)
             unsub()
+            endedTurn = ev.data.turn
             if (ev.data.reason.kind === 'blocked') blocked = true
             resolve()
           }
@@ -416,7 +418,15 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
         }))
       }
       await done
-      return { text: collected.join(''), interrupted: entry.interrupted, blocked }
+      // An aborted turn's in-flight stream can keep delivering after it ended
+      // (the output was already generated); those late chunks belong to the
+      // old turn and must not bleed into this turn's answer — filter by the
+      // turn number that actually ended. Fall back to unfiltered when the
+      // end event carried no turn.
+      const resultText = endedTurn > 0
+        ? collected.filter((c) => c.turn === endedTurn).map((c) => c.delta).join('')
+        : collected.map((c) => c.delta).join('')
+      return { text: resultText, interrupted: entry.interrupted, blocked }
     } finally {
       if (chatTurns.get(chatId) === entry) chatTurns.delete(chatId)
     }
