@@ -49,7 +49,7 @@ export interface Config {
   stream: boolean
   /** 看门狗时长：单回合超过该毫秒数则 cancel 该回合并回错误卡片。 */
   maxTurnMs: number
-  /** 插队阈值：运行中回合超过该毫秒数，新消息打断它优先处理。 */
+  /** 插队阈值：运行中回合超过该毫秒数，新消息打断它优先处理（0 = 立即打断）。 */
   interruptAfterMs: number
   /** 飞书流式卡片推送节流间隔（ms）。 */
   streamThrottleMs: number
@@ -66,7 +66,7 @@ export const Config = z.object({
   feishuAppSecret: z.string().default(''),
   stream: z.boolean().default(true),
   maxTurnMs: z.number().default(600_000),
-  interruptAfterMs: z.number().default(10_000),
+  interruptAfterMs: z.number().default(0),
   streamThrottleMs: z.number().default(40),
   streamThrottleChars: z.number().default(12),
   maxReplyChars: z.number().default(4000),
@@ -422,11 +422,11 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     }
   }
 
-  /** Interrupt a slow running turn so the new message gets processed promptly (M13). */
+  /** Interrupt a running turn so the new message gets processed promptly (M13); threshold 0 = always. */
   async function interruptIfSlow(chatId: string): Promise<void> {
     const running = chatTurns.get(chatId)
     if (running === undefined) return
-    if (Date.now() - running.startedAt < config.interruptAfterMs) return
+    if (config.interruptAfterMs > 0 && Date.now() - running.startedAt < config.interruptAfterMs) return
     log(`interrupting slow turn on ${chatId} (${Math.round((Date.now() - running.startedAt) / 1000)}s)`)
     running.cancel()
   }
