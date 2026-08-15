@@ -710,6 +710,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     log,
     cmdReply,
     sessionIdForChat,
+    getAgent: (chatId) => agents?.get(sessionIdForChat(chatId)),
     epochFor,
     appendEpoch,
     persist,

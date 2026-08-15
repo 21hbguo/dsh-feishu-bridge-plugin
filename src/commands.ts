@@ -19,9 +19,11 @@ import { firstSentence } from './text.js'
 import type {
   BridgeAgent,
   BridgeAgentRegistry,
+  BridgeApprovalService,
   BridgeLlm,
   BridgeLogEvent,
   BridgeModelPreference,
+  BridgePermissionPresetsService,
   BridgeSessionPersistence,
   BridgeSessionStore,
   BridgeTranscriptEntry,
@@ -55,6 +57,8 @@ export interface CommandRuntime {
   log(...args: unknown[]): void
   cmdReply(msg: NormalizedMessage, text: string): Promise<void>
   sessionIdForChat(chatId: string): string
+  /** Live agent of the chat's current session, if any (sync; no session creation). */
+  getAgent(chatId: string): BridgeAgent | undefined
   epochFor(chatId: string): string
   appendEpoch(chatId: string, epoch: string): void
   persist(): void
@@ -92,8 +96,7 @@ function currentModel(runtime: CommandRuntime, chatId: string): BridgeModelPrefe
 
 /** Live agent of the chat's current session, if any. */
 function liveAgent(runtime: CommandRuntime, chatId: string): BridgeAgent | undefined {
-  const agents = runtime.ctx.get('agents') as BridgeAgentRegistry | undefined
-  return agents?.get(runtime.sessionIdForChat(chatId))
+  return runtime.getAgent(chatId)
 }
 
 /** Switch the live agent's route in place so the next turn uses the new model. */
@@ -484,13 +487,38 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
       },
     },
     yolo: {
-      desc: '本会话免审批模式（自动放行工具审批）',
+      desc: '本会话免审批模式（权限预设切 danger-full-access，/yolo off 恢复）',
       async run(msg, arg) {
         const off = arg.trim().toLowerCase() === 'off'
-        runtime.chatYoloPrefs.set(msg.chatId, !off)
-        await cmdReply(msg, off
-          ? '🔒 YOLO 已关闭：审批卡片恢复。'
-          : '⚡ YOLO 已开启：本会话工具审批将自动放行，不再弹卡片。发送 /yolo off 关闭。')
+        const agent = runtime.getAgent(msg.chatId)
+        const presets = runtime.ctx.get('permissionPresets') as BridgePermissionPresetsService | undefined
+        const approval = runtime.ctx.get('approval') as BridgeApprovalService | undefined
+        if (off) {
+          // 关闭：恢复受管模式。flag 无条件清除（approval.ts 的兜底自动放行随之关闭）；
+          // agent/服务齐备才做预设切换，缺一也不阻塞 flag 关闭（优雅降级）。
+          if (agent !== undefined && presets !== undefined && approval !== undefined) {
+            approval.setPolicy(agent, 'ask')
+            presets.set(agent.session, 'workspace-write')
+          }
+          runtime.chatYoloPrefs.set(msg.chatId, false)
+          await cmdReply(msg, '🔒 YOLO 已关闭：本会话恢复 workspace-write（工具审批恢复）。')
+          return
+        }
+        if (agent === undefined) {
+          await cmdReply(msg, '⚠️ 会话尚未激活：先发一条消息让 DSH 会话就绪，再开启 /yolo。')
+          return
+        }
+        if (presets === undefined || approval === undefined) {
+          await cmdReply(msg, '⚠️ 权限预设服务不可用（未装配 permissionPresets/approval），无法切换。')
+          return
+        }
+        // 顺序关键：先 setPolicy（写 approval/policy 事件 + 注入模型可见通知），
+        // 再 permissionPresets.set()——set() 内部写 approval knob 时值已相同则幂等
+        // 跳过，不会让 setPolicy 的通知因 early-return 丢失（调研报告 §5.1）。
+        approval.setPolicy(agent, 'never')
+        presets.set(agent.session, 'danger-full-access')
+        runtime.chatYoloPrefs.set(msg.chatId, true)
+        await cmdReply(msg, '⚡ YOLO 已开启：本会话权限预设 → danger-full-access（免审批直接执行）。/yolo off 恢复。')
       },
     },
   }

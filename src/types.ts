@@ -118,6 +118,32 @@ export interface BridgeAgentRegistry {
   roots(): BridgeAgent[]
 }
 
+/**
+ * Approval policy values (mirror of APPROVAL_POLICIES in dsh-user-approval:
+ * ['ask', 'never']). 'never' is the YOLO 免审批端，'ask' 是受管模式。
+ */
+export type BridgeApprovalPolicy = 'ask' | 'never'
+
+/**
+ * Approval service surface the /yolo command drives (mirror of
+ * ApprovalService.setPolicy — live per-agent switch: writes the
+ * approval/policy knob and injects a model-visible notification; early-returns
+ * when the policy is unchanged).
+ */
+export interface BridgeApprovalService {
+  setPolicy(agent: BridgeAgent, policy: BridgeApprovalPolicy): void
+}
+
+/**
+ * Permission-presets service surface the /yolo command drives (mirror of
+ * PermissionPresetsService.set — per-session preset switch: appends
+ * permission/preset then writes the sandbox/mode + approval/policy knobs
+ * idempotently; unknown names throw).
+ */
+export interface BridgePermissionPresetsService {
+  set(session: BridgeSession, name: string): void
+}
+
 /** Result of tokenMeter.measure (mirror of TokenMeasurement). */
 export interface BridgeTokenMeasurement {
   totalTokens: number
