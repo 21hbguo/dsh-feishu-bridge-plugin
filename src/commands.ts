@@ -279,6 +279,51 @@ async function ensureResumable(runtime: CommandRuntime, chatId: string, sessionI
 }
 
 /**
+ * Render the /status reply text for one chat — the exact text the /status
+ * command sends. Shared with the restart announcement (index.ts) so every
+ * remembered chat gets a fresh per-chat snapshot without a manual /status:
+ * each chat has its own workspace/session, so the snapshot must be rendered
+ * per chatId with the same value sources the command uses.
+ */
+export async function renderStatus(runtime: CommandRuntime, chatId: string): Promise<string> {
+  const lines = [
+    `🤖 bot: ${runtime.channel.botIdentity?.name ?? runtime.appId}`,
+    `🧩 模型: ${await runtime.modelLabel(chatId)}`,
+    `💬 会话: ${runtime.sessionIdForChat(chatId)}`,
+    `📁 工作区: ${workspaceLabel(runtime, chatId)}`,
+    `🔄 流式: ${(runtime.chatStreamPrefs.get(chatId) ?? runtime.streamDefault) ? 'on' : 'off'}`,
+    `⏳ 队列深度: ${runtime.queueDepth(chatId)}`,
+    `🕐 运行时长: ${Math.round((Date.now() - runtime.STARTED_AT) / 60_000)} 分钟`,
+  ]
+  const currentEpoch = runtime.epochFor(chatId)
+  let answers = (runtime.chatTranscript.get(chatId) ?? [])
+    .filter((e) => e.role === 'assistant' && e.epoch === currentEpoch)
+    .slice(-5)
+  if (answers.length === 0) {
+    // The in-memory transcript resets on plugin reload/restart; fall
+    // back to the current session's persisted log so excerpts survive
+    // restarts and /resume switches.
+    const sessionId = runtime.sessionIdForChat(chatId)
+    const persistence = runtime.ctx.get('sessionPersistence') as BridgeSessionPersistence | undefined
+    if (persistence !== undefined) {
+      try {
+        const { events } = await persistence.inspect(sessionId)
+        answers = latestAssistantAnswers(events ?? [], 5)
+          .map((text) => ({ role: 'assistant' as const, text, epoch: currentEpoch }))
+      } catch { /* keep empty */ }
+    }
+  }
+  if (answers.length > 0) {
+    lines.push('', '📜 当前会话最近回答（各取第一句）：')
+    answers.forEach((a, i) => {
+      const s = firstSentence(a.text)
+      if (s !== '') lines.push(`${i + 1}. ${s}`)
+    })
+  }
+  return lines.join('\n')
+}
+
+/**
  * Register the slash-command table against the bridge runtime and return the
  * dispatcher handle() uses. Command state mutations (epochs, workspace
  * binding, model preference) go through the runtime maps and persist().
@@ -305,41 +350,7 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
     status: {
       desc: '查看桥与当前会话状态（含最近对话）',
       async run(msg) {
-        const lines = [
-          `🤖 bot: ${runtime.channel.botIdentity?.name ?? runtime.appId}`,
-          `🧩 模型: ${await runtime.modelLabel(msg.chatId)}`,
-          `💬 会话: ${runtime.sessionIdForChat(msg.chatId)}`,
-          `📁 工作区: ${workspaceLabel(runtime, msg.chatId)}`,
-          `🔄 流式: ${(runtime.chatStreamPrefs.get(msg.chatId) ?? runtime.streamDefault) ? 'on' : 'off'}`,
-          `⏳ 队列深度: ${runtime.queueDepth(msg.chatId)}`,
-          `🕐 运行时长: ${Math.round((Date.now() - runtime.STARTED_AT) / 60_000)} 分钟`,
-        ]
-        const currentEpoch = runtime.epochFor(msg.chatId)
-        let answers = (runtime.chatTranscript.get(msg.chatId) ?? [])
-          .filter((e) => e.role === 'assistant' && e.epoch === currentEpoch)
-          .slice(-5)
-        if (answers.length === 0) {
-          // The in-memory transcript resets on plugin reload/restart; fall
-          // back to the current session's persisted log so excerpts survive
-          // restarts and /resume switches.
-          const sessionId = runtime.sessionIdForChat(msg.chatId)
-          const persistence = runtime.ctx.get('sessionPersistence') as BridgeSessionPersistence | undefined
-          if (persistence !== undefined) {
-            try {
-              const { events } = await persistence.inspect(sessionId)
-              answers = latestAssistantAnswers(events ?? [], 5)
-                .map((text) => ({ role: 'assistant' as const, text, epoch: currentEpoch }))
-            } catch { /* keep empty */ }
-          }
-        }
-        if (answers.length > 0) {
-          lines.push('', '📜 当前会话最近回答（各取第一句）：')
-          answers.forEach((a, i) => {
-            const s = firstSentence(a.text)
-            if (s !== '') lines.push(`${i + 1}. ${s}`)
-          })
-        }
-        await cmdReply(msg, lines.join('\n'))
+        await cmdReply(msg, await renderStatus(runtime, msg.chatId))
       },
     },
     reset: {

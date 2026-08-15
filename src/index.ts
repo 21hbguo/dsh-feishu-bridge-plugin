@@ -16,7 +16,7 @@ import type { Context } from 'cordis'
 import z from 'schemastery'
 import { createBatcher } from './batching.js'
 import { registerApproval } from './approval.js'
-import { registerCommands } from './commands.js'
+import { registerCommands, renderStatus, type CommandRuntime } from './commands.js'
 import { registerQuestions } from './questions.js'
 import { buildChannel } from './lark.js'
 import { loadState, saveState, sessionIdFor, type BridgeState } from './state.js'
@@ -766,8 +766,10 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   // ------------------------------------------------------------ commands (see src/commands.ts)
   // The slash-command table lives in src/commands.ts; the runtime hands
   // registerCommands every piece of state the commands touch, and the returned
-  // dispatcher is what handle() enqueues for '/'-prefixed messages.
-  const runCommand = registerCommands({
+  // dispatcher is what handle() enqueues for '/'-prefixed messages. The same
+  // runtime object is reused by the restart announcement to render per-chat
+  // /status snapshots (renderStatus) with identical value sources.
+  const commandRuntime: CommandRuntime = {
     ctx,
     channel,
     appId,
@@ -792,7 +794,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     queueDepth,
     modelLabel,
     restartChannel,
-  }).runCommand
+  }
+  const runCommand = registerCommands(commandRuntime).runCommand
 
   // ------------------------------------------------------------ questions (see src/questions.ts)
   /** Reverse-map a DSH session id back to the Feishu chat that owns it. */
@@ -847,9 +850,18 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   async function notifyRestarted(): Promise<void> {
     const chatIds = [...new Set([...chatEpochs.keys(), ...chatSessionList.keys(), ...chatWorkspaces.keys()])]
     if (chatIds.length === 0) return
-    const text = '✅ bridge 已重启完成，可以继续对话。\n会话记忆已保留；发送 /help 查看可用命令。'
+    const restartText = '✅ bridge 已重启完成，可以继续对话。\n会话记忆已保留；发送 /help 查看可用命令。'
     await Promise.allSettled(chatIds.map(async (chatId) => {
-      try { await channel.send(chatId, { text }) } catch (error) { log(`restart notice to ${chatId} failed:`, errorMessage(error)) }
+      try {
+        // Per-chat /status snapshot: each chat has its own workspace/session,
+        // so render one per chat inside the loop (never share across chats).
+        // A failed render (e.g. the session is gone) falls back to sending
+        // the plain restart notice only.
+        let text = restartText
+        const snapshot = await renderStatus(commandRuntime, chatId).catch(() => '')
+        if (snapshot.trim() !== '') text = `${restartText}\n\n${snapshot}`
+        await channel.send(chatId, { text })
+      } catch (error) { log(`restart notice to ${chatId} failed:`, errorMessage(error)) }
     }))
     log(`restart notice sent to ${chatIds.length} chat(s)`)
   }
