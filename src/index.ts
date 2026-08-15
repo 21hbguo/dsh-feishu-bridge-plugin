@@ -131,6 +131,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   const chatEpochs = new Map(Object.entries(state.chatEpochs))
   const chatSessionList = new Map(Object.entries(state.chatSessionList))
   const chatWorkspaces = new Map(Object.entries(state.chatWorkspaces))
+  /** Per-chat current-session override: a web session (session-<uuid>) resumed into the chat. */
+  const chatSessionOverride = new Map(Object.entries(state.chatSessionOverride))
 
   /** Stable base epoch (web-mode semantics: session ids survive restarts). */
   const EPOCH = '0'
@@ -145,6 +147,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     state.chatEpochs = Object.fromEntries(chatEpochs)
     state.chatSessionList = Object.fromEntries(chatSessionList)
     state.chatWorkspaces = Object.fromEntries(chatWorkspaces)
+    state.chatSessionOverride = Object.fromEntries(chatSessionOverride)
     saveState(state)
   }
 
@@ -167,8 +170,10 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     return EPOCH
   }
 
-  /** DSH session id for a Feishu chat, stable per chat+epoch. */
+  /** DSH session id for a Feishu chat: the resumed web session override, else `feishu-<epoch>-<slug>`. */
   function sessionIdForChat(chatId: string): string {
+    const over = chatSessionOverride.get(chatId)
+    if (over !== undefined) return over
     return sessionIdFor(chatId, epochFor(chatId))
   }
 
@@ -740,6 +745,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     streamDefault: config.stream,
     chatEpochs,
     chatWorkspaces,
+    chatSessionOverride,
     chatTurns,
     chatStreamPrefs,
     chatYoloPrefs,

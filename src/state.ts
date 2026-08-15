@@ -13,6 +13,8 @@ export interface BridgeState {
   chatEpochs: Record<string, string>
   chatSessionList: Record<string, string[]>
   chatWorkspaces: Record<string, string>
+  /** Per-chat current-session override: a web session (session-<uuid>) resumed into the chat. */
+  chatSessionOverride: Record<string, string>
 }
 
 /** Load the state file; any failure yields the empty default (bridge.mjs loadState). */
@@ -23,9 +25,10 @@ export function loadState(): BridgeState {
       chatEpochs: parsed.chatEpochs ?? {},
       chatSessionList: parsed.chatSessionList ?? {},
       chatWorkspaces: parsed.chatWorkspaces ?? {},
+      chatSessionOverride: parsed.chatSessionOverride ?? {},
     }
   } catch {
-    return { chatEpochs: {}, chatSessionList: {}, chatWorkspaces: {} }
+    return { chatEpochs: {}, chatSessionList: {}, chatWorkspaces: {}, chatSessionOverride: {} }
   }
 }
 

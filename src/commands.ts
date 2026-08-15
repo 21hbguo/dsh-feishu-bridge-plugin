@@ -48,6 +48,8 @@ export interface CommandRuntime {
   streamDefault: boolean
   chatEpochs: Map<string, string>
   chatWorkspaces: Map<string, string>
+  /** Per-chat current-session override: a web session (session-<uuid>) resumed into the chat. */
+  chatSessionOverride: Map<string, string>
   chatTurns: Map<string, BridgeTurnEntry>
   chatStreamPrefs: Map<string, boolean>
   /** Per-chat YOLO 免审批开关（/yolo 设置；内存态，重启自动关闭，不持久化）。 */
@@ -168,9 +170,12 @@ interface ResumeRow {
 }
 
 /**
- * Top-10 sessions of this Feishu chat: live sessions (sessions.list /
- * agents.roots) merged with cold persisted sessions, ranked by creation time,
- * with latest-answer excerpts (bridge.mjs recentSessions/latestAnswer).
+ * Top-10 sessions of this Feishu chat: with a bound workspace, every session
+ * of that workspace (feishu-* and web session-* alike — the shared pool the
+ * web GUI shows); without one, the chat's own feishu-* sessions (legacy).
+ * Live sessions (sessions.list / agents.roots) are merged with cold persisted
+ * sessions, ranked by creation time, with latest-answer excerpts (bridge.mjs
+ * recentSessions/latestAnswer). Archived sessions are hidden.
  */
 async function recentSessions(runtime: CommandRuntime, chatId: string): Promise<ResumeRow[]> {
   const slug = chatId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40)
@@ -198,9 +203,12 @@ async function recentSessions(runtime: CommandRuntime, chatId: string): Promise<
   }
 
   const matches = (id: string): boolean =>
-    id.startsWith('feishu-') && id.endsWith(`-${slug}`)
-    && !archived.has(id) && (allowed === null || allowed.has(id))
-  const epochOf = (id: string): string => id.slice('feishu-'.length, id.length - slug.length - 1)
+    !archived.has(id) && (allowed !== null
+      ? allowed.has(id)
+      : id.startsWith('feishu-') && id.endsWith(`-${slug}`))
+  /** Epoch for feishu sessions; web sessions use their own id as the row key. */
+  const epochOf = (id: string): string =>
+    id.startsWith('feishu-') ? id.slice('feishu-'.length, id.length - slug.length - 1) : id
 
   const candidates = new Map<string, { createdAt: number; running: boolean; events: readonly BridgeLogEvent[] | null }>()
   for (const session of sessions?.list() ?? []) {
@@ -328,6 +336,7 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
         const next = nextEpoch(runtime, msg.chatId)
         runtime.chatEpochs.set(msg.chatId, next)
         runtime.appendEpoch(msg.chatId, next)
+        runtime.chatSessionOverride.delete(msg.chatId)
         await cmdReply(msg, '✅ 已重置本会话记忆，开始新的 DSH 会话。')
       },
     },
@@ -387,6 +396,7 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
         const next = nextEpoch(runtime, msg.chatId)
         runtime.chatEpochs.set(msg.chatId, next)
         runtime.appendEpoch(msg.chatId, next)
+        runtime.chatSessionOverride.delete(msg.chatId)
         runtime.persist()
         await cmdReply(msg, `✅ 已切到工作区「${workspace.title}」（${workspace.path}），并开了新会话（记忆已清空）。`)
       },
@@ -456,7 +466,9 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
     resume: {
       desc: '列出最近会话（Top10，带摘要）或切换：/resume 或 /resume <序号>',
       async run(msg, arg) {
-        const current = runtime.chatEpochs.get(msg.chatId) ?? runtime.EPOCH
+        // The chat's current session id: a resumed web session override, else
+        // the feishu-<epoch>-<slug> session of the current epoch.
+        const currentSessionId = runtime.sessionIdForChat(msg.chatId)
         const n = Number.parseInt(arg, 10)
         let recent: ResumeRow[]
         try {
@@ -474,10 +486,10 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
               : '—'
             const excerpt = s.summary.replace(/\s+/g, ' ').trim()
             const label = excerpt !== '' ? `「${excerpt.length > 40 ? `${excerpt.slice(0, 40)}…` : excerpt}」` : '（无内容）'
-            return `${i + 1}. ${label}${s.epoch === current ? ' ← 当前' : ''}（活跃 ${when}）${s.running ? ' ⏳运行中' : ''}`
+            return `${i + 1}. ${label}${s.sessionId === currentSessionId ? ' ← 当前' : ''}（活跃 ${when}）${s.running ? ' ⏳运行中' : ''}`
           }))
           if (runtime.chatWorkspaces.get(msg.chatId) !== undefined) {
-            lines.push('（仅显示当前工作区的会话；其他工作区请先 /workspace 切换过去再看）')
+            lines.push('（显示当前工作区的全部会话——含 web 端创建的会话；已归档的已隐藏）')
           }
           lines.push('输入 /resume <序号> 切换并恢复那段记忆。')
           await cmdReply(msg, lines.join('\n'))
@@ -485,15 +497,22 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
         }
         const item = recent[n - 1]
         if (item === undefined) { await cmdReply(msg, `序号无效（可用 1-${recent.length}，先 /resume 查看）。`); return }
-        if (item.epoch === current) { await cmdReply(msg, `已经是会话 #${n}，无需切换。`); return }
+        if (item.sessionId === currentSessionId) { await cmdReply(msg, `已经是会话 #${n}，无需切换。`); return }
         try {
           await ensureResumable(runtime, msg.chatId, item.sessionId)
         } catch (error) {
           await cmdReply(msg, `⚠️ 恢复失败：${errorMessage(error).slice(0, 200)}`)
           return
         }
-        runtime.chatEpochs.set(msg.chatId, item.epoch)
-        runtime.appendEpoch(msg.chatId, item.epoch)
+        if (item.sessionId.startsWith('feishu-')) {
+          runtime.chatEpochs.set(msg.chatId, item.epoch)
+          runtime.appendEpoch(msg.chatId, item.epoch)
+          runtime.chatSessionOverride.delete(msg.chatId)
+        } else {
+          // A web session becomes the chat's current session (override);
+          // the feishu epoch bookkeeping is untouched while it stays active.
+          runtime.chatSessionOverride.set(msg.chatId, item.sessionId)
+        }
         // Sync the workspace binding if the resumed session belongs to a
         // different workspace than the chat is bound to (sessionIds authoritative).
         try {
