@@ -112,6 +112,38 @@ flowchart LR
 
 ### 第二步：安装插件（两种方式二选一）
 
+#### 方式 C：命令行一键安装（推荐给熟悉命令行的用户）
+
+> 支持 Linux / macOS（bash）。Windows 用户请使用下方「只下载不安装」命令拿到 tgz 后，按方式 A 手动安装。
+
+一条命令自动完成「下载最新 Release → 解压到 `~/dsh-plugins/dsh-feishu-bridge` → 装配进 `web` profile → 建软链」：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/21hbguo/dsh-feishu-bridge-plugin/main/scripts/install.sh | bash
+```
+
+或分步执行（建议先下载查看脚本内容再运行）：
+
+```bash
+curl -fsSL -o install.sh https://raw.githubusercontent.com/21hbguo/dsh-feishu-bridge-plugin/main/scripts/install.sh
+bash install.sh
+```
+
+默认装配到 `web` profile；可用参数自定义，例如：
+
+```bash
+bash install.sh --profile my-profile --dir ~/dsh-plugins/dsh-feishu-bridge
+bash install.sh --help    # 查看全部参数与示例
+```
+
+只下载不安装（把最新 tgz 下载到当前目录）：
+
+```bash
+curl -fsSL -O https://github.com/21hbguo/dsh-feishu-bridge-plugin/releases/latest/download/dsh-external-dsh-feishu-bridge-0.0.1.tgz
+```
+
+脚本自动完成下载 / 解压 / 装配 / 建软链，完成后**完全重启 DSH** 即生效；想手动控制每一步，参考方式 A。
+
 #### 方式 A：标准装配（无注入器，推荐）
 
 不需要任何注入器或开发工具，手动装配 4 步：
