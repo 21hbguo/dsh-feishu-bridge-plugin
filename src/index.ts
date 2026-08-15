@@ -24,6 +24,7 @@ import { formatTokens, stripMentions, truncate } from './text.js'
 import type {
   BridgeAgent,
   BridgeAgentRegistry,
+  BridgeLogEvent,
   BridgeModelPreference,
   BridgeSessionEvent,
   BridgeSessionPersistence,
@@ -763,6 +764,73 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     return '—'
   }
 
+  /**
+   * The agent preset the chat's session runs on. Durable, same resolution as
+   * the agent-presets service's resolveSessionPreset: the latest logged
+   * `agent-preset/selected` event wins, else the creation header's
+   * `agentPreset` (written from create meta by dsh-session). Live session
+   * first, persisted-log fallback so /status works after a restart when no
+   * agent is live; undefined when the deployment composes no preset.
+   */
+  async function agentPreset(chatId: string): Promise<string | undefined> {
+    const resolve = (header: { agentPreset?: string } | undefined, events: readonly BridgeLogEvent[]): string | undefined => {
+      for (let i = events.length - 1; i >= 0; i--) {
+        const ev = events[i]
+        if (ev.type !== 'agent-preset/selected') continue
+        const p = (ev.data as { agentPreset?: string }).agentPreset
+        if (p !== undefined && p !== '') return p
+      }
+      const h = header?.agentPreset
+      return h !== undefined && h !== '' ? h : undefined
+    }
+    const sessionId = sessionIdForChat(chatId)
+    const agent = agents?.get(sessionId)
+    if (agent !== undefined) {
+      const found = resolve(agent.session.header as { agentPreset?: string } | undefined, agent.session.events ?? [])
+      if (found !== undefined) return found
+    }
+    const persistence = ctx.get('sessionPersistence') as BridgeSessionPersistence | undefined
+    if (persistence !== undefined) {
+      try {
+        const { meta, events } = await persistence.inspect(sessionId)
+        return resolve(meta as { agentPreset?: string } | undefined, events ?? [])
+      } catch { /* persistence read failed — fall through */ }
+    }
+    return undefined
+  }
+
+  /**
+   * The reasoning effort the chat's session actually ran with. Same source
+   * modelLabel reads: the live request header first, then the persisted
+   * `request/header` log (config.reasoningEffort — an adapter-defined opaque
+   * level string). undefined when the model exposes no effort.
+   */
+  async function reasoningEffort(chatId: string): Promise<string | undefined> {
+    const sessionId = sessionIdForChat(chatId)
+    const agent = agents?.get(sessionId)
+    if (agent !== undefined) {
+      const config = agent.session.requestHeader?.()?.config as
+        | { provider?: string; model?: string; reasoningEffort?: string }
+        | undefined
+      const effort = config?.reasoningEffort
+      if (effort !== undefined && effort !== '') return effort
+    }
+    const persistence = ctx.get('sessionPersistence') as BridgeSessionPersistence | undefined
+    if (persistence !== undefined) {
+      try {
+        const { events } = await persistence.inspect(sessionId)
+        for (let i = events.length - 1; i >= 0; i--) {
+          const ev = events[i]
+          if (ev.type !== 'request/header') continue
+          const header = (ev.data as { header?: { config?: { provider?: string; model?: string; reasoningEffort?: string } } }).header
+          const effort = header?.config?.reasoningEffort
+          if (effort !== undefined && effort !== '') return effort
+        }
+      } catch { /* persistence read failed — fall through */ }
+    }
+    return undefined
+  }
+
   // ------------------------------------------------------------ commands (see src/commands.ts)
   // The slash-command table lives in src/commands.ts; the runtime hands
   // registerCommands every piece of state the commands touch, and the returned
@@ -793,6 +861,9 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     persist,
     queueDepth,
     modelLabel,
+    readCumulativeUsage,
+    agentPreset,
+    reasoningEffort,
     restartChannel,
   }
   const runCommand = registerCommands(commandRuntime).runCommand

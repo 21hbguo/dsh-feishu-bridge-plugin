@@ -15,7 +15,7 @@
 
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk'
 import type { Context } from 'cordis'
-import { firstSentence } from './text.js'
+import { firstSentence, formatTokens } from './text.js'
 import type {
   BridgeAgent,
   BridgeAgentRegistry,
@@ -67,6 +67,12 @@ export interface CommandRuntime {
   queueDepth(chatId: string): number
   /** Current model label (durable: live agent request config → options → persisted log → default). */
   modelLabel(chatId: string): Promise<string>
+  /** Cumulative per-session token usage ({billed, output}), null when unknown. */
+  readCumulativeUsage(chatId: string): { billed: number; output: number } | null
+  /** The agent preset the chat's session runs on (creation header, then logged switches); undefined when the deployment composes none. */
+  agentPreset(chatId: string): Promise<string | undefined>
+  /** Reasoning effort the session actually ran with (live request header, then persisted request/header log); undefined when the model has none. */
+  reasoningEffort(chatId: string): Promise<string | undefined>
   restartChannel(): Promise<void>
 }
 
@@ -286,15 +292,29 @@ async function ensureResumable(runtime: CommandRuntime, chatId: string, sessionI
  * per chatId with the same value sources the command uses.
  */
 export async function renderStatus(runtime: CommandRuntime, chatId: string): Promise<string> {
+  const [model, preset, effort, usage] = await Promise.all([
+    runtime.modelLabel(chatId),
+    runtime.agentPreset(chatId),
+    runtime.reasoningEffort(chatId),
+    Promise.resolve(runtime.readCumulativeUsage(chatId)),
+  ])
+  const agentStatus = runtime.getAgent(chatId)?.status
   const lines = [
     `🤖 bot: ${runtime.channel.botIdentity?.name ?? runtime.appId}`,
-    `🧩 模型: ${await runtime.modelLabel(chatId)}`,
+    `🧩 模型: ${model}`,
     `💬 会话: ${runtime.sessionIdForChat(chatId)}`,
     `📁 工作区: ${workspaceLabel(runtime, chatId)}`,
+  ]
+  // 四项扩展信息全部条件显示：无值（未装配/无 agent/无推理档位/用量未知）时不显示对应行，不编造。
+  if (preset !== undefined && preset !== '') lines.push(`🎛️ 模式: ${preset}`)
+  if (effort !== undefined && effort !== '') lines.push(`🧠 思考强度: ${effort}`)
+  if (usage !== null) lines.push(`🔢 token: billed ${formatTokens(usage.billed)} / output ${formatTokens(usage.output)}`)
+  if (agentStatus !== undefined) lines.push(`⚡ agent: ${agentStatus}`)
+  lines.push(
     `🔄 流式: ${(runtime.chatStreamPrefs.get(chatId) ?? runtime.streamDefault) ? 'on' : 'off'}`,
     `⏳ 队列深度: ${runtime.queueDepth(chatId)}`,
     `🕐 运行时长: ${Math.round((Date.now() - runtime.STARTED_AT) / 60_000)} 分钟`,
-  ]
+  )
   const currentEpoch = runtime.epochFor(chatId)
   let answers = (runtime.chatTranscript.get(chatId) ?? [])
     .filter((e) => e.role === 'assistant' && e.epoch === currentEpoch)
