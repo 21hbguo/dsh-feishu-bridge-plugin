@@ -89,46 +89,128 @@ flowchart LR
 
 ## 🚀 快速开始
 
+从零到用上大约 10 分钟：先在飞书开放平台配好应用，再把插件装进 DSH，最后在飞书里与机器人对话。
+
 ### 前提
 
 - 已部署 **DSH（DeepSeek Harness）** 环境。
 - 本插件 `peerDependencies` 依赖 DSH 内部包（`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-tools`，不发布于公开 npm）以及 `cordis`、`schemastery`，**必须运行在 DSH 进程内**，无法独立安装或独立部署。
-- 在[飞书开放平台](https://open.feishu.cn/)创建**企业自建应用**，开通机器人能力（消息接收 / 发送、交互卡片等），取得 **App ID** 与 **App Secret**。
+- 一个可登录[飞书开放平台](https://open.feishu.cn/)的账号。
 
-### 方式一：从 Releases 安装（推荐）
+### 第一步：飞书开放平台配置
 
-1. 在 [GitHub Releases](https://github.com/21hbguo/dsh-feishu-bridge-plugin/releases) 下载最新版本的 `.tgz` 包（如 `dsh-external-dsh-feishu-bridge-0.0.1.tgz`）。
-2. 在 DSH 管理端使用注入器安装：
-   - `dev_inject_plugin <包目录>` —— 运行时注入，免重启；或
-   - `dev_install_package <包目录>` —— 热装配并写入装配清单，重启后依然生效。
-3. 配置凭据（见下），插件装配后即可在飞书里与机器人对话。
+本插件使用**长连接模式**与飞书通信：插件主动发起 WebSocket 连接收发消息，**不需要公网回调地址，也不需要配置任何 webhook**。只需按下面步骤把应用信息准备好：
 
-### 方式二：源码构建
+1. 打开[飞书开放平台](https://open.feishu.cn/) → 进入「开发者后台」→ 点击**创建企业自建应用**，填写名称与描述后创建。
+2. 在应用详情页的「添加应用能力」中启用**机器人**。
+3. 在「权限管理」中搜索并开通以下两个权限：
+   - `im:message` —— 读取用户发给机器人的消息（含群聊 @ 消息）；
+   - `im:message:send_as_bot` —— 以机器人身份发送消息。
+4. 在「可用范围」中添加需要使用机器人的成员与群组（默认可能为空，不加则任何人都用不了）。
+5. 在「版本管理与发布」中**创建版本并发布**，等待审核通过后应用才真正生效。⚠️ 大量「机器人不回复」的案例都是只保存了配置、忘了发布版本。
+6. 在「凭证与基础信息」中记下 **App ID**（形如 `cli_xxxxxxxx`）与 **App Secret**，第三步会用到。
 
-1. `git clone https://github.com/21hbguo/dsh-feishu-bridge-plugin`（或从 Releases 下载源码包）。
-2. 构建需要 DSH checkout 环境：`scripts/build.sh` 会把 DSH checkout 内的 `cordis`、`schemastery`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-tools` 等依赖以目录链接接入 `node_modules`，并使用 checkout 自带的 `tsc` 编译——这些内部依赖不在公开 npm 上，因此**脱离 DSH checkout 无法独立构建**。
+### 第二步：安装插件（两种方式二选一）
+
+#### 方式 A：标准装配（无注入器，推荐）
+
+不需要任何注入器或开发工具，手动装配 4 步：
+
+1. **下载并解压**：在 [GitHub Releases](https://github.com/21hbguo/dsh-feishu-bridge-plugin/releases) 下载最新 `.tgz` 包（如 `dsh-external-dsh-feishu-bridge-0.0.1.tgz`），解压到固定目录（示例 `~/dsh-plugins/dsh-feishu-bridge`）：
 
    ```bash
-   DSH_CHECKOUT=<dsh-checkout-路径> bash scripts/build.sh
+   mkdir -p ~/dsh-plugins/dsh-feishu-bridge
+   tar -xzf dsh-external-dsh-feishu-bridge-0.0.1.tgz -C ~/dsh-plugins/dsh-feishu-bridge --strip-components=1
    ```
 
-3. 构建产物为 `lib/`，随后同样用注入器安装。
+2. **编辑 profile 配置**：打开 `~/.dsh/profiles/<profile>/package.json`（`<profile>` 为你的 profile 名，如 `web`），把插件加入依赖与装配清单：
 
-> 💡 绝大多数用户请直接使用方式一，无需本地构建。
+   ```json
+   {
+     "name": "dsh-profile-web",
+     "dependencies": {
+       "@dsh-external/dsh-feishu-bridge": "link:/home/xxx/dsh-plugins/dsh-feishu-bridge"
+     },
+     "dsh": {
+       "profile": {
+         "bundles": ["@deepseek-ai/dsh-base", "@dsh-external/dsh-feishu-bridge"]
+       }
+     }
+   }
+   ```
 
-### 配置
+   把 `link:` 后面的路径替换为第 1 步的解压目录。
 
-凭据通过**环境变量**或插件 **Config** 提供（Config 优先）：
+3. **建立 node_modules 软链**：在 profile 的 `node_modules/@dsh-external/` 下创建指向解压目录的链接（目录不存在先创建）：
+
+   ```bash
+   # Linux / macOS
+   mkdir -p ~/.dsh/profiles/<profile>/node_modules/@dsh-external
+   ln -s ~/dsh-plugins/dsh-feishu-bridge ~/.dsh/profiles/<profile>/node_modules/@dsh-external/dsh-feishu-bridge
+   ```
+
+   ```powershell
+   # Windows（PowerShell）
+   New-Item -ItemType Directory -Force "$env:USERPROFILE\.dsh\profiles\<profile>\node_modules\@dsh-external"
+   New-Item -ItemType Junction -Path "$env:USERPROFILE\.dsh\profiles\<profile>\node_modules\@dsh-external\dsh-feishu-bridge" -Target "$env:USERPROFILE\dsh-plugins\dsh-feishu-bridge"
+   ```
+
+   ```cmd
+   # Windows（cmd，管理员权限）
+   mkdir "%USERPROFILE%\.dsh\profiles\<profile>\node_modules\@dsh-external"
+   mklink /D "%USERPROFILE%\.dsh\profiles\<profile>\node_modules\@dsh-external\dsh-feishu-bridge" "%USERPROFILE%\dsh-plugins\dsh-feishu-bridge"
+   ```
+
+4. **重启 DSH**：完全退出并重新启动 DSH（不是刷新页面），插件随 profile 装配自动加载。
+
+> 已安装 `dsh-super-injector` 注入器的用户请直接用方式 B，一行命令完成装配与软链，无需手动编辑。
+
+#### 方式 B：注入器一键安装（已有 dsh-super-injector）
+
+1. 在 [GitHub Releases](https://github.com/21hbguo/dsh-feishu-bridge-plugin/releases) 下载最新 `.tgz` 包，解压得到包目录（方法同方式 A 第 1 步）。
+2. 在 DSH 管理端对**包目录**使用注入器：
+   - `dev_install_package <包目录>` —— 热装配并写入装配清单，重启后依然生效（推荐）；
+   - `dev_inject_plugin <包目录>` —— 运行时注入，免重启（重启后失效）。
+
+> 可选：从源码构建（进阶）。`git clone https://github.com/21hbguo/dsh-feishu-bridge-plugin` 后，需在 DSH checkout 环境下执行 `DSH_CHECKOUT=<dsh-checkout-路径> bash scripts/build.sh`（产物为 `lib/`），随后按方式 A 或方式 B 安装。构建依赖 DSH 内部包，**脱离 DSH checkout 无法独立构建**，绝大多数用户无需走这条路。
+
+### 第三步：配置凭据（二选一）
+
+使用第一步第 6 点拿到的 App ID / App Secret，环境变量或插件 Config 二选一（**Config 优先**）：
+
+**方式 1：环境变量** —— 在启动 DSH 的终端（或启动脚本）中导出：
 
 ```bash
 export FEISHU_APP_ID="cli_xxxxxxxxxxxxxxxx"
 export FEISHU_APP_SECRET="xxxxxxxxxxxxxxxx"
 ```
 
-| 环境变量 | 说明 |
+**方式 2：插件 Config** —— 在 DSH 插件配置中填写：
+
+| 字段 | 说明 |
 | --- | --- |
-| `FEISHU_APP_ID` | 飞书应用 App ID（Config 未填时的回退） |
-| `FEISHU_APP_SECRET` | 飞书应用 App Secret（Config 未填时的回退） |
+| `feishuAppId` | 飞书应用 App ID（未填时回退 `FEISHU_APP_ID`） |
+| `feishuAppSecret` | 飞书应用 App Secret（未填时回退 `FEISHU_APP_SECRET`） |
+
+两者都配置时 Config 生效；都未配置时插件启动会报缺凭据错误。
+
+### 第四步：验证
+
+1. 在飞书里搜索机器人（应用名称），**私聊**发送一条消息，如 `你好`。
+2. 机器人应回复**流式卡片**：DSH 的思考与工具调用进度逐字实时渲染，回复底部显示本会话 token 用量，即链路正常。
+3. 在**群聊**里测试：必须 **@机器人** 才会触发回复（私聊无需 @）。
+
+### 常见问题排错表
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 机器人完全不回复 | 应用未**发布版本**（只保存了配置） | 开放平台 → 版本管理与发布 → 创建版本并发布，等待审核通过 |
+| 机器人完全不回复 | 当前用户/群不在应用**可用范围**内 | 开放平台 → 可用范围 → 添加测试成员与群组 |
+| 报错 403 / 权限不足 | 未开通 `im:message` / `im:message:send_as_bot` | 「权限管理」开通后需**重新创建版本并发布**再试 |
+| 群聊不回复 | 消息没有 @ 机器人 | 群聊必须 @ 机器人才会进入处理，私聊无需 @ |
+| 启动报缺凭据 | App ID / App Secret 未配置或填错 | 核对环境变量 / Config 与开放平台「凭证与基础信息」是否一致 |
+| 插件未生效（无日志、无机器人） | profile 装配 / 软链 / 重启未完成 | 核对 `dependencies` 与 `bundles` 是否包含插件、`node_modules` 软链是否指向解压目录、是否完全重启 DSH |
+| 回复不是逐字刷新 | 流式开关被关闭 | 私聊发送 `/stream on` 开启流式回复 |
 
 ## ⚙️ 配置项
 
