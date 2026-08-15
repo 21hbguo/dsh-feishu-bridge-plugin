@@ -171,6 +171,8 @@ export interface BridgeWorkspaceRegistry {
   list(): BridgeWorkspace[]
   get(id: string): BridgeWorkspace | undefined
   create(path: string, title?: string): Promise<BridgeWorkspace>
+  /** Registry-global archive set: sessions archived in the web GUI are hidden from every grouping surface there. */
+  readonly archivedSessionIds?: readonly string[]
 }
 
 /** LLM route directory (mirror of the llm service catalog reads /model uses). */

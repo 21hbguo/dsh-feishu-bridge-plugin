@@ -179,6 +179,12 @@ async function recentSessions(runtime: CommandRuntime, chatId: string): Promise<
   for (const agent of agents?.roots() ?? []) liveStatus.set(agent.id, agent.status ?? 'idle')
   const sessions = runtime.ctx.get('sessions') as BridgeSessionStore | undefined
 
+  // Registry-global archive set: sessions archived in the web GUI (workspace
+  // browser archive action) are hidden from every grouping surface there;
+  // /resume must match, or archived sessions keep showing up in the list.
+  const registry = runtime.ctx.get('workspaceRegistry') as BridgeWorkspaceRegistry | undefined
+  const archived = new Set<string>(registry?.archivedSessionIds ?? [])
+
   // Scope to the chat's current workspace (bridge.mjs web mode): the bound
   // workspace's sessionIds is the authoritative membership. No bound workspace
   // → keep all feishu sessions (legacy behavior).
@@ -186,14 +192,14 @@ async function recentSessions(runtime: CommandRuntime, chatId: string): Promise<
   const bound = runtime.chatWorkspaces.get(chatId)
   if (bound !== undefined) {
     try {
-      const registry = runtime.ctx.get('workspaceRegistry') as BridgeWorkspaceRegistry | undefined
       const w = registry?.list().find((it) => it.id === bound)
       if (w !== undefined) allowed = new Set(w.sessionIds?.map(String) ?? [])
     } catch { /* workspace.list failed — fall through to unfiltered */ }
   }
 
   const matches = (id: string): boolean =>
-    id.startsWith('feishu-') && id.endsWith(`-${slug}`) && (allowed === null || allowed.has(id))
+    id.startsWith('feishu-') && id.endsWith(`-${slug}`)
+    && !archived.has(id) && (allowed === null || allowed.has(id))
   const epochOf = (id: string): string => id.slice('feishu-'.length, id.length - slug.length - 1)
 
   const candidates = new Map<string, { createdAt: number; running: boolean; events: readonly BridgeLogEvent[] | null }>()
