@@ -77,6 +77,8 @@ export interface Config {
   maxMessageChars: number
   /** 入站限流：每 chat 每分钟消息数上限（agent 注入前防护；0 = 不限制）。 */
   rateLimitPerMinute: number
+  /** 无 /effort 偏好时的默认思考强度档位（deepseek 默认 omitted⇒high，本插件默认 max；模型不支持时适配器兜底）。 */
+  defaultEffort: string
 }
 
 export const Config = z.object({
@@ -91,6 +93,7 @@ export const Config = z.object({
   batchWindowMs: z.number().min(0).default(800),
   maxMessageChars: z.number().min(0).default(20_000),
   rateLimitPerMinute: z.number().min(0).default(30),
+  defaultEffort: z.string().default('max'),
 })
 
 /** One-line error text from any thrown value. */
@@ -439,7 +442,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
           // (AgentOptions has no reasoningEffort field — see src/effort.ts),
           // registered at creation/resume time exactly like the web GUI's
           // model-selection setup; takes effect on the next turn.
-          setup: (agentCtx) => { installEffortPref(agentCtx, () => chatEffortPrefs.get(chatId)) },
+          setup: (agentCtx) => { installEffortPref(agentCtx, () => chatEffortPrefs.get(chatId) ?? config.defaultEffort) },
         })
         // Let the loop reach quiescence before the first followup (headless pattern).
         await agent.whenIdle()
@@ -463,7 +466,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
       sessionId,
       meta: { cwd, agentPreset: presetId },
       ...(agentOptions === undefined ? {} : { agentOptions }),
-      setup: (agentCtx) => { installEffortPref(agentCtx, () => chatEffortPrefs.get(chatId)) },
+      setup: (agentCtx) => { installEffortPref(agentCtx, () => chatEffortPrefs.get(chatId) ?? config.defaultEffort) },
     })
     if (workspace !== undefined) {
       try { await workspace.attachSession(sessionId) } catch (error) {
