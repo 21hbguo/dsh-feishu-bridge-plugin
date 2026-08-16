@@ -134,8 +134,12 @@ export type BridgeCommandResult =
 /** Tier-3 injection target: forward an unhandled slash line into the agent (index.ts wires processNormalText). */
 export type AgentInjection = (msg: NormalizedMessage, text: string) => Promise<void>
 
+/** /status 附加行提供者（index.ts 注入 quota 熔断状态等运行时信息；返回空串/undefined 则不显示）。 */
+export type StatusExtra = () => string | undefined
+
 let commandsHost: BridgeCommandsHost | undefined
 let agentFallback: AgentInjection | undefined
+let statusExtra: StatusExtra | undefined
 
 /**
  * Tier-2 wiring point (called by index.ts at apply time, before any message):
@@ -153,6 +157,14 @@ export function setCommandsHost(host: BridgeCommandsHost | undefined): void {
  */
 export function setAgentFallback(fallback: AgentInjection | undefined): void {
   agentFallback = fallback
+}
+
+/**
+ * /status 附加行注入点（index.ts 接线，可选）：一行运行时状态（如配额熔断）。
+ * undefined 不显示；返回空串也不显示。不改变 CommandRuntime 契约。
+ */
+export function setStatusExtra(provider: StatusExtra | undefined): void {
+  statusExtra = provider
 }
 
 /** One command row of the COMMANDS table. */
@@ -416,6 +428,11 @@ export async function renderStatus(runtime: CommandRuntime, chatId: string): Pro
       const s = firstSentence(a.text)
       if (s !== '') lines.push(`${i + 1}. ${s}`)
     })
+  }
+  // /status 附加行（index.ts 注入）：配额熔断等运行时信息，空则不显示。
+  if (statusExtra !== undefined) {
+    const extra = statusExtra()
+    if (extra !== undefined && extra !== '') lines.push(extra)
   }
   return lines.join('\n')
 }
