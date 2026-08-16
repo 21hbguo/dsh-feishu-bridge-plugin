@@ -86,8 +86,8 @@ const QR_READY_TIMEOUT_MS = 30_000
 
 /**
  * 启动扫码配置流程：registerApp 只调一次，qrReady / result 共享同一底层流程。
- * appPreset 带 {user} 占位（替换为扫码者名字）；addons 增量申请机器人收发权限、
- * im.message.receive_v1 事件与 card.action.trigger 回调；createOnly 只允许创建
+ * appPreset 带 {user} 占位（替换为扫码者名字）；addons 增量申请机器人收发/表情
+ * 权限、im.message.receive_v1 事件与 card.action.trigger 回调；createOnly 只允许创建
  * 新应用。注意：addons 需要平台灰度、可能被忽略（被忽略时权限预填不生效，但
  * 创建流程仍可用），调用方在文案里提示用户后台补开权限。
  */
@@ -119,7 +119,8 @@ export function beginSetupFlow(handlers: SetupFlowHandlers = {}): SetupFlow {
       desc: '由 DSH 飞书桥插件一键创建',
     },
     addons: {
-      scopes: { tenant: ['im:message', 'im:message:send_as_bot'] },
+      // im:message.reaction：表情回执（收到消息随机表情 / 完成打 DONE）的发送权限。
+      scopes: { tenant: ['im:message', 'im:message:send_as_bot', 'im:message.reaction'] },
       events: { items: { tenant: ['im.message.receive_v1'] } },
       callbacks: { items: ['card.action.trigger'] },
     },
