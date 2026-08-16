@@ -11,7 +11,7 @@
  * 提问/问答卡片系统见 src/questions.ts（进程内 api.respond，不注册 userQuestions
  * provider）；/workspace /model /resume 命令见 src/commands.ts。
  */
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk'
 import type { Context } from 'cordis'
@@ -25,9 +25,11 @@ import { registerApproval } from './approval.js'
 import { registerCommands, renderStatus, setAgentFallback, setCommandsHost, setStatusExtra, type BridgeCommandsHost, type CommandRuntime } from './commands.js'
 import { installEffortPref } from './effort.js'
 import { renderReply } from './markdown-card.js'
+import { resolveInboundMedia, type AttachmentStoreLike } from './media.js'
 import { registerQuestions } from './questions.js'
 import { createQuotaGovernor } from './quota.js'
 import { doneReaction, pickReaction } from './reactions.js'
+import { registerSendFileTool } from './send-file.js'
 import { buildChannel } from './lark.js'
 import { beginSetupFlow, loadCredentials, saveCredentials, setupErrorMessage, type SetupFlow } from './setup.js'
 import { loadState, saveState, sessionIdFor, type BridgeState } from './state.js'
@@ -290,6 +292,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   // ------------------------------------------------------------ P0 reliability: outbox + inbound WAL
   // 入站 WAL：注入 agent 之前落盘，回复确认送达后记账；崩溃/重载后可补发。
   const wal = createWal({ dir: join(homedir(), '.dsh', 'dsh-feishu-bridge', 'wal') })
+  // P2 入站媒体落盘目录（与 state/wal/outbox 同根：~/.dsh/dsh-feishu-bridge/media）。
+  const mediaDir = join(homedir(), '.dsh', 'dsh-feishu-bridge', 'media')
   // 出站 Outbox：回复投递走持久化队列（at-least-once）。deliver 注入 channel.send，
   // 成功即触发该消息的 WAL delivered（"回复已送达"是补发语义的终点）。
   const outbox = createOutbox({
@@ -392,6 +396,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
 
   // ------------------------------------------------------------ agent driving
   const agents = ctx.get('agents') as BridgeAgentRegistry | undefined
+  // P2 入站媒体：DSH attachment 存储（可选服务，未装配时图片降级为本地路径注记）。
+  const attachmentStore = ctx.get('attachments') as AttachmentStoreLike | undefined
 
   /**
    * Resolve the deployment's default model route. agents.create does NOT
@@ -529,6 +535,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
    * @param mode - 'queue' waits for the current turn; 'steer' injects into it.
    * @param onStatus - optional live progress callback (tool calls) so multi-step
    * turns show activity on the streaming card instead of a static "思考中".
+   * @param blocks - P2 媒体注入：非空时整体作为消息内容块（文本注记 +
+   * ImageBlock 等），否则回退纯文本。
    */
   async function thinkTurn(
     chatId: string,
@@ -536,6 +544,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     onChunk?: (delta: string) => void,
     mode: 'queue' | 'steer' = 'queue',
     onStatus?: (toolName: string) => void,
+    blocks?: ContentBlock[],
   ): Promise<{ text: string; interrupted: boolean; blocked: boolean }> {
     const sessionId = sessionIdForChat(chatId)
     const agent = await ensureAgent(chatId, sessionId)
@@ -594,14 +603,17 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
           }
         })
       })
+      const content: ContentBlock[] = blocks !== undefined && blocks.length > 0
+        ? blocks
+        : [{ type: 'text', text }]
       if (mode === 'steer') {
         agent.steer(createUserMessage({
-          content: [{ type: 'text', text }],
+          content,
           source: { kind: 'user' },
         }))
       } else {
         agent.followup(createUserMessage({
-          content: [{ type: 'text', text }],
+          content,
           source: { kind: 'user' },
         }))
       }
@@ -707,7 +719,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
 
   // ------------------------------------------------------------ streaming answer
   /** Streaming reply card fed live from DSH chunk events. */
-  async function streamAnswer(msg: NormalizedMessage, text: string, mode: 'queue' | 'steer' = 'queue'): Promise<void> {
+  async function streamAnswer(msg: NormalizedMessage, text: string, mode: 'queue' | 'steer' = 'queue', blocks?: ContentBlock[]): Promise<void> {
     try {
       let streamed = ''
       let interrupted = false
@@ -719,7 +731,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
             void controller.append(`\n\n> 🔧 正在调用工具：${toolName}…`).catch(() => {})
           }
           try {
-            const result = await thinkTurn(msg.chatId, text, onChunk, mode, onStatus)
+            const result = await thinkTurn(msg.chatId, text, onChunk, mode, onStatus, blocks)
             streamed = result.text
             interrupted = result.interrupted
             blocked = result.blocked
@@ -876,17 +888,20 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
    * branch. Shared by immediate (forced-mode / /ai / batching-disabled)
    * messages and by batched flushes.
    * @param opts.replayed - 入站补发重放：不再 accept（避免重置补发次数上限）。
+   * @param opts.media - P2 媒体消息注入：携带内容块（文本注记 + ImageBlock），
+   * 且短路 WAL accept —— 媒体消息不进补发（WAL 只记注入文本；媒体下载依赖飞书
+   * 侧资源时效与配额，重放不可靠，与 lark-link「只补发纯文本」决策一致）。
    */
   async function processNormalText(
     msg: NormalizedMessage,
     text: string,
     forced: 'queue' | 'steer' | undefined,
-    opts: { replayed?: boolean } = {},
+    opts: { replayed?: boolean; media?: { content: ContentBlock[]; transcriptText: string } } = {},
   ): Promise<void> {
     // P0 入站 WAL：注入 agent 之前落盘（崩溃/重载后补发；批处理合并文本时
     // 只记一条 —— messageId 取 flush 携带的最后一条消息，text 为合并全文，
-    // 补发重放的就是同一回合）。
-    if (!opts.replayed) {
+    // 补发重放的就是同一回合）。媒体消息（opts.media）不进 WAL。
+    if (!opts.replayed && opts.media === undefined) {
       try {
         wal.accept({ messageId: msg.messageId, chatKey: msg.chatId, text })
       } catch (error) {
@@ -897,12 +912,12 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     // Queue mode: never interrupt the running turn. Steer mode (default): cut in line.
     if (mode === 'steer') await interruptIfSlow(msg.chatId)
 
-    recordTranscript(msg.chatId, 'user', text)
+    recordTranscript(msg.chatId, 'user', opts.media?.transcriptText ?? text)
 
     const streaming = chatStreamPrefs.get(msg.chatId) ?? config.stream
     if (streaming) {
       try {
-        await enqueue(msg.chatId, () => streamAnswer(msg, text, mode))
+        await enqueue(msg.chatId, () => streamAnswer(msg, text, mode, opts.media?.content))
       } catch (error) {
         if (error instanceof TurnTimeoutError) await handleTimeout(msg)
       }
@@ -913,7 +928,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     // and cumulative-token footer. P0：回复走 Outbox（at-least-once）；投递成功
     // 即 WAL delivered（deliver 注入钩子），enqueue 幂等短路时直接记账。
     try {
-      const result = await enqueue(msg.chatId, () => thinkTurn(msg.chatId, text, undefined, mode))
+      const result = await enqueue(msg.chatId, () => thinkTurn(msg.chatId, text, undefined, mode, undefined, opts.media?.content))
       const answer = result.text
       recordTranscript(msg.chatId, 'assistant', answer)
       if (answer.trim() === '') {
@@ -967,6 +982,24 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     : undefined
 
   /**
+   * P2 媒体消息处理：下载/落盘/提取由 src/media.ts 完成，注入复用纯文本管线
+   * （stream/queue、插队、Outbox、DONE 回执）。失败降级：提示用户（「图片/
+   * 文件下载失败，请重试」）；无凭据（401/403）安静降级只记日志 —— 均不阻塞
+   * 主流程。媒体消息不进 WAL 补发（见 processNormalText 的 opts.media 注释）。
+   */
+  async function processMedia(msg: NormalizedMessage): Promise<void> {
+    const res = await resolveInboundMedia({ msg, channel, mediaDir, attachmentStore, log })
+    if (res.kind === 'failed') {
+      if (res.quiet) return // 无凭据环境：安静降级（media.ts 已记日志）
+      void cmdReply(msg, res.userHint ?? '⚠️ 媒体处理失败，请重试。').catch(() => {})
+      return
+    }
+    log(`media message ${msg.messageId} chat=${msg.chatId} type=${msg.rawContentType} → agent injection`)
+    // text 形参此时不用（注入内容在 opts.media.content 块里），传空串占位。
+    await processNormalText(msg, '', undefined, { media: res })
+  }
+
+  /**
    * 入站消息入口。opts.replayed = 入站补发重放：该消息当初已通过过滤/限流，
    * 重放只重跑注入管线（跳过过滤、命令解析、限流，也不重复 WAL accept）。
    */
@@ -975,6 +1008,16 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
       const botOpenId = channel.botIdentity?.openId
       if (msg.senderId === botOpenId) return
       if (msg.chatType === 'group' && !msg.mentionedBot) return
+    }
+
+    // P2 入站多媒体分流：image/file 消息（SDK 已把 content 归一化为占位文本，
+    // 真正的媒体在 msg.resources）走媒体管线 —— 下载 → attachment/本地落盘 →
+    // ImageBlock 或文本提取注入。媒体消息不进 WAL 补发（媒体下载依赖飞书资源
+    // 时效与配额，重放不可靠；WAL 重放构造的消息 rawContentType 恒为 text，
+    // 本分支仅对实时消息生效 —— 与 lark-link「只补发纯文本」决策一致）。
+    if (!opts.replayed && (msg.rawContentType === 'image' || msg.rawContentType === 'file')) {
+      await processMedia(msg)
+      return
     }
 
     let text = stripMentions(msg)
@@ -1225,8 +1268,15 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     : `🔌 连接配额剩余 ${quota.remaining()} 次`)
 
   // ------------------------------------------------------------ questions (see src/questions.ts)
-  /** Reverse-map a DSH session id back to the Feishu chat that owns it. */
+  /**
+   * Reverse-map a DSH session id back to the Feishu chat that owns it。
+   * P2 扩展：先查 /resume 的 web 会话覆盖项（chatSessionOverride 直映射），
+   * 再查常规 epoch 会话 —— 供工具调用上下文（exec.agent.id）反查 chat。
+   */
   function chatIdForSession(sessionId: string): string | undefined {
+    for (const [chatId, override] of chatSessionOverride) {
+      if (override === sessionId) return chatId
+    }
     for (const [chatId, epochs] of chatSessionList) {
       for (const epoch of epochs) {
         if (sessionIdFor(chatId, epoch) === sessionId) return chatId
@@ -1259,6 +1309,29 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     return chatYoloPrefs.get(chatId) === true
   }
   const approvals = registerApproval({ ctx, channel, chatIdForSession, isYolo, log })
+
+  // ---- P2 出站文件工具（见 src/send-file.ts）-----------------------------------
+  // 模型经 lark_send_local_file 把本地文件回传到当前 chat。工具注册在运行时
+  // （createRuntime）内：闭包直取 channel / chatIdForSession / chatWorkspaces，
+  // 凭据重建（rebuildChannel）时随 runtime dispose 注销、新代重注册，不残留。
+  // 与 feishu_setup 同策略：tools 服务未装配只告警，不阻塞桥本身。
+  const unregisterSendFile = registerSendFileTool({
+    tools: ctx.get('tools') as { register(tool: ToolDefinition): () => void } | undefined,
+    channel,
+    chatIdForSession,
+    workspacePathFor: (chatId) => {
+      const workspaceId = chatWorkspaces.get(chatId)
+      if (workspaceId === undefined) return undefined
+      const registry = ctx.get('workspaceRegistry') as BridgeWorkspaceRegistry | undefined
+      try {
+        return registry?.get(workspaceId)?.path
+      } catch {
+        return undefined
+      }
+    },
+    dataDir: join(homedir(), '.dsh', 'dsh-feishu-bridge'),
+    log,
+  })
 
   // ---- P0 入站补发对账（启动流程末尾，fire-and-forget）--------------------------
   // accepted 而未 delivered 的记录 = 上次进程/插件在回合中途死掉，用户消息被吞。
@@ -1363,6 +1436,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     sessionListeners.clear()
     try { questions.dispose() } catch { /* already gone */ }
     try { approvals.dispose() } catch { /* already gone */ }
+    try { unregisterSendFile?.() } catch { /* already gone */ }
     batcher?.dispose()
     // P0：停 outbox 泵（等 in-flight 投递收敛；未投递的 envelope 已在磁盘，
     // 下次启动/重建后由 rebuildFromDisk 恢复）。
