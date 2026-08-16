@@ -284,6 +284,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   const chatSessionOverride = new Map(Object.entries(state.chatSessionOverride))
   /** Per-chat thinking-effort preference set by /effort; applied on the next turn (persisted). */
   const chatEffortPrefs = new Map(Object.entries(state.chatEffortPrefs))
+  /** Per-chat agent-mode (agentPreset id) preference set by /mode; applied at the next session creation (persisted). */
+  const chatModes = new Map(Object.entries(state.chatModes))
 
   /** Stable base epoch (web-mode semantics: session ids survive restarts). */
   const EPOCH = '0'
@@ -451,9 +453,12 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
       ? (ctx.get('workspaceRegistry') as BridgeWorkspaceRegistry | undefined)?.get(workspaceId)
       : undefined
     const cwd = workspace?.path ?? process.cwd()
-    // Follow the deployment's default agent preset, falling back to the
-    // standard preset when the roster is not mounted.
-    const presetId = (ctx.get('agentPresets') as { defaultId: string } | undefined)?.defaultId ?? 'standard'
+    // /mode 的 per-chat 偏好优先；无偏好回落部署默认 preset，最后兜底 standard。
+    // （agentPresets 服务未装配时 chatModes 里也不会有值——/mode 在服务缺失时
+    // 只允许切 standard——因此回落链与旧行为完全一致。）
+    const presetId = chatModes.get(chatId)
+      ?? (ctx.get('agentPresets') as { defaultId: string } | undefined)?.defaultId
+      ?? 'standard'
     const { agent } = await agents.create({
       sessionId,
       meta: { cwd, agentPreset: presetId },
@@ -1239,6 +1244,7 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     chatYoloPrefs,
     chatModelPrefs,
     chatEffortPrefs,
+    chatModes,
     chatTranscript,
     log,
     cmdReply,
