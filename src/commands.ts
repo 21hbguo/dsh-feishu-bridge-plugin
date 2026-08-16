@@ -29,9 +29,16 @@
  *     ——同文件 permissionCard 的档位列表 + command-router.ts 的 /permission
  *     应用路径（permissionPresets 预设 / sandbox-mode 会话事件）；
  *   - /doctor 诊断包 —— 实现在 src/doctor.ts（见其文件头）。
+ * P2.5 /mode 多模式切换（同样借鉴自 amlyczz/dsh-lark-link (MIT)
+ * src/index.ts 的 /mode handler 与 rotate() 语义）：
+ *   - 单选卡枚举 agentPresets 服务实时 roster（list()，服务不可达/空时回退
+ *     提示 + 内置 standard），按钮 value `cmd|mode|<presetId>`；
+ *   - 切换 = 保存 chatModes 偏好（state.ts saveChatMode 独占写）+ 当前 chat
+ *     会话重置（复用 /reset 的 epoch+1 路径，新会话行、旧行保留——化用
+ *     lark-link rotate() 的「重建会话生效」语义，但不销毁旧 agent）。
  * 卡片回调订阅沿用 questions.ts / approval.ts 的独立订阅模式（channel.on
- * 'cardAction' + value 前缀路由 cmd|model|… / cmd|perm|…，互不干扰），并
- * 新增 commands.dispose() 供 index.ts teardown 卸载（可选接线）。
+ * 'cardAction' + value 前缀路由 cmd|model|… / cmd|perm|… / cmd|mode|…，互不
+ * 干扰），并新增 commands.dispose() 供 index.ts teardown 卸载（可选接线）。
  */
 
 import type { CardActionEvent, LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk'
@@ -40,7 +47,7 @@ import { runDoctor } from './doctor.js'
 import { saveCredentials, setupErrorMessage, type SetupFlow } from './setup.js'
 import { firstSentence, formatTokens } from './text.js'
 import { currentEffort, installEffortPref, supportedEfforts } from './effort.js'
-import { loadState, savePermissionTier, type PermissionTier } from './state.js'
+import { loadState, saveChatMode, savePermissionTier, type PermissionTier } from './state.js'
 import type {
   BridgeAgent,
   BridgeAgentRegistry,
@@ -83,6 +90,8 @@ export interface CommandRuntime {
   chatModelPrefs: Map<string, BridgeModelPreference>
   /** Per-chat thinking-effort preference set by /effort; applied on the next turn (persisted). */
   chatEffortPrefs: Map<string, string>
+  /** Per-chat agent-mode (agentPreset id) preference set by /mode; applied at the next session creation (persisted). */
+  chatModes: Map<string, string>
   chatTranscript: Map<string, BridgeTranscriptEntry[]>
   log(...args: unknown[]): void
   cmdReply(msg: NormalizedMessage, text: string): Promise<void>
@@ -190,6 +199,24 @@ interface Command {
 function nextEpoch(runtime: CommandRuntime, chatId: string): string {
   const n = Number(runtime.chatEpochs.get(chatId)?.split('-').pop() ?? 0)
   return `${runtime.EPOCH}-${n + 1}`
+}
+
+/**
+ * 开新会话（epoch+1，旧会话行保留）：/reset、/new、/mode 切换共用。
+ * 化用 lark-link rotate() 的「mint 全新会话、旧行保留」语义——本机会话 id 由
+ * epoch 派生（feishu-<epoch>-<slug>），epoch+1 即天然的新会话行；旧 agent 不
+ * dispose（dispose 会让旧会话从 store 消失 / 触发 id 冲突，见 lark-link 注释），
+ * 任其闲置由宿主回收，下一条消息经 ensureAgent 在新 epoch 上创建新 agent。
+ */
+function resetChatSession(runtime: CommandRuntime, chatId: string): void {
+  const next = nextEpoch(runtime, chatId)
+  // Clear the session override BEFORE any persist: appendEpoch persists
+  // synchronously, so deleting after it left a stale web-session binding
+  // in state.json (survives reloads/restarts) — the /new escape hatch
+  // silently failed.
+  runtime.chatSessionOverride.delete(chatId)
+  runtime.chatEpochs.set(chatId, next)
+  runtime.appendEpoch(chatId, next)
 }
 
 /** The chat's current model: /model preference first, then the live agent's options. */
@@ -638,15 +665,112 @@ function permissionPickerCard(current: PermissionTier): object {
   return { schema: '2.0', header: { title: { tag: 'plain_text', content: '切换权限' }, template: 'orange' }, body: { elements } }
 }
 
+// ---------------------------------------------------------------------------
+// P2.5 /mode 多模式切换：单选卡枚举 + 即点即切 + 会话重建生效 + 持久化。
+// 设计借鉴自 amlyczz/dsh-lark-link (MIT) src/index.ts 的 /mode handler
+// （实时 roster + 切换后 rotate() 重建会话）与 src/presentation/cards.ts
+// modeCard；化用差异见 resetChatSession 注释（本机用 epoch+1 而非 runNonce）。
+// ---------------------------------------------------------------------------
+
+/**
+ * agentPresets 服务的结构镜像（本插件不 import @deepseek-ai/dsh-agent，
+ * 与 src/types.ts 同策略；真实服务见 DSH packages/preset/agent-presets）。
+ */
+interface BridgeAgentPresetsService {
+  defaultId: string
+  list(): Promise<BridgeAgentPreset[]>
+}
+
+/** AgentPreset 行（host preset.ts AgentPreset 的字段镜像）。 */
+interface BridgeAgentPreset {
+  id: string
+  trust?: string
+  name?: string
+  description?: string
+  broken?: string
+}
+
+/** 服务不可达/空列表时的回退 roster：仅内置 standard（ensureAgent 的兜底预设）。 */
+const FALLBACK_MODES: ReadonlyArray<BridgeAgentPreset> = [
+  { id: 'standard', name: '标准模式', description: '内置回退预设（agentPresets 服务不可用时唯一可用）', trust: 'system' },
+]
+
+/** 预设显示名：name 优先，缺省回落 id（host AgentPreset 无 label 字段）。 */
+function presetLabel(p: BridgeAgentPreset): string {
+  return p.name ?? p.id
+}
+
+/**
+ * 实时读取 agentPresets 服务的 roster（list()）。服务未装配、list 缺失、
+ * list() 抛错（服务不可达/发现失败）一律返回 []——调用方据此安静降级，
+ * 不把异常抛给用户（与 /model 的 llm 失败处理同风格）。
+ */
+async function liveModeRoster(runtime: CommandRuntime): Promise<BridgeAgentPreset[]> {
+  const presets = runtime.ctx.get('agentPresets') as BridgeAgentPresetsService | undefined
+  if (presets?.list === undefined) return []
+  try {
+    return await presets.list()
+  } catch {
+    return []
+  }
+}
+
+/** 当前 chat 的模式偏好：/mode 持久化偏好 → 宿主默认 preset → standard。 */
+function currentModeId(runtime: CommandRuntime, chatId: string): string {
+  const pref = runtime.chatModes.get(chatId)
+  if (pref !== undefined) return pref
+  const presets = runtime.ctx.get('agentPresets') as BridgeAgentPresetsService | undefined
+  if (presets?.defaultId !== undefined && presets.defaultId !== '') return presets.defaultId
+  return 'standard'
+}
+
+/** /mode 单选卡：每预设一个按钮（broken 的只列不点），当前模式标识。 */
+function modePickerCard(current: string, roster: ReadonlyArray<BridgeAgentPreset>): object {
+  const currentRow = roster.find((p) => p.id === current)
+  const elements: object[] = [
+    { tag: 'markdown', content: `**当前模式**：${currentRow !== undefined ? presetLabel(currentRow) : current}${currentRow === undefined ? '（不在列表中）' : ''}` },
+    { tag: 'markdown', content: '**选择 Agent 模式**（点按钮即切换：当前会话将重置，下条消息生效；其他会话不受影响）' },
+  ]
+  for (const p of roster) {
+    elements.push({
+      tag: 'markdown',
+      content: `${presetLabel(p)} — ${p.description ?? p.id}${p.id === current ? '（当前）' : ''}${p.broken !== undefined ? `（不可用：${p.broken}）` : ''}`,
+    })
+    if (p.broken === undefined) {
+      elements.push({
+        tag: 'button',
+        width: 'fill',
+        text: { tag: 'plain_text', content: presetLabel(p) },
+        behaviors: [{ type: 'callback', value: { key: `cmd|mode|${p.id}` } }],
+      })
+    }
+  }
+  return { schema: '2.0', header: { title: { tag: 'plain_text', content: '切换模式' }, template: 'indigo' }, body: { elements } }
+}
+
+/**
+ * /mode 切换路径（命令与卡片回调共用）：持久化偏好（独占写）→ 内存态 →
+ * 会话重置（复用 /reset 的 epoch+1，旧行保留）→ 回执。顺序关键：先落盘
+ * 再重置——resetChatSession 的 appendEpoch 会触发 persist()，而 saveState
+ * 保留磁盘 chatModes，两者互不覆盖。
+ */
+async function switchChatMode(runtime: CommandRuntime, msg: NormalizedMessage, preset: BridgeAgentPreset): Promise<void> {
+  runtime.chatModes.set(msg.chatId, preset.id)
+  saveChatMode(msg.chatId, preset.id)
+  resetChatSession(runtime, msg.chatId)
+  const label = presetLabel(preset)
+  await runtime.cmdReply(msg, `✅ 模式已切换为 ${label}${preset.trust === 'user' ? '（自定义）' : ''}（当前会话已重置，下条消息生效；其他会话不受影响）。`)
+}
+
 /** CardActionEvent → NormalizedMessage 最小适配（cmdReply 只读 messageId/chatId）。 */
 function cardActionAsMessage(evt: CardActionEvent): NormalizedMessage {
   return { messageId: evt.messageId, chatId: evt.chatId } as NormalizedMessage
 }
 
 /**
- * 命令卡回调路由（P2）：`cmd|model|<provider>|<model>` 与 `cmd|perm|<tier>`。
- * 与 questions.ts / approval.ts 各自独立订阅（互不干扰）；非 cmd| 前缀直接
- * 返回，不碰他人卡片。
+ * 命令卡回调路由（P2/P2.5）：`cmd|model|<provider>|<model>`、`cmd|perm|<tier>`
+ * 与 `cmd|mode|<presetId>`。与 questions.ts / approval.ts 各自独立订阅（互不
+ * 干扰）；非 cmd| 前缀直接返回，不碰他人卡片。
  */
 async function onCommandCardAction(runtime: CommandRuntime, evt: CardActionEvent): Promise<void> {
   try {
@@ -669,6 +793,22 @@ async function onCommandCardAction(runtime: CommandRuntime, evt: CardActionEvent
       const tier = tierForInput(parts[2] ?? '')
       if (tier === undefined) return
       await runtime.cmdReply(msg, await setPermissionTier(runtime, msg, tier))
+    } else if (parts[1] === 'mode') {
+      const presetId = parts.slice(2).join('|')
+      if (presetId === '') return
+      // 点按时重读实时 roster 校验（卡可能已陈旧：预设被删/新增/变 broken）。
+      const live = await liveModeRoster(runtime)
+      const roster = live.length > 0 ? live : FALLBACK_MODES
+      const preset = roster.find((p) => p.id === presetId)
+      if (preset === undefined) {
+        await runtime.cmdReply(msg, `⚠️ 未知模式「${presetId}」（可用：${roster.map((p) => p.id).join(' / ')}）。`)
+        return
+      }
+      if (preset.broken !== undefined) {
+        await runtime.cmdReply(msg, `⚠️ 模式「${presetLabel(preset)}」当前不可用（${preset.broken}）。`)
+        return
+      }
+      await switchChatMode(runtime, msg, preset)
     }
   } catch (error) {
     runtime.log('command cardAction handling failed:', errorMessage(error))
@@ -734,14 +874,7 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner & { dis
     reset: {
       desc: '清空本会话记忆（开新 DSH 会话）',
       async run(msg) {
-        const next = nextEpoch(runtime, msg.chatId)
-        // Clear the session override BEFORE any persist: appendEpoch persists
-        // synchronously, so deleting after it left a stale web-session binding
-        // in state.json (survives reloads/restarts) — the /new escape hatch
-        // silently failed.
-        runtime.chatSessionOverride.delete(msg.chatId)
-        runtime.chatEpochs.set(msg.chatId, next)
-        runtime.appendEpoch(msg.chatId, next)
+        resetChatSession(runtime, msg.chatId)
         await cmdReply(msg, '✅ 已重置本会话记忆，开始新的 DSH 会话。')
       },
     },
@@ -880,6 +1013,36 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner & { dis
         runtime.chatModelPrefs.set(msg.chatId, pref)
         applyModelToLiveAgent(runtime, msg.chatId, pref)
         await cmdReply(msg, `✅ 已切换模型：${entry.model}（${entry.providerName ?? entry.provider}），下一回合生效（记忆保留）。`)
+      },
+    },
+    mode: {
+      desc: '切换 Agent 模式：/mode（单选卡）| /mode <id>（点卡即切，会话重置生效）',
+      async run(msg, arg) {
+        const argText = arg.trim()
+        const live = await liveModeRoster(runtime)
+        // 服务不可达/空列表 → 安静降级：提示 + 内置 standard 回退（不抛异常）。
+        const roster = live.length > 0 ? live : FALLBACK_MODES
+        const degraded = live.length === 0
+        if (argText === '') {
+          if (degraded) {
+            await cmdReply(msg,
+              '⚠️ 预设服务不可用（未装配 agentPresets 或预设列表为空）。\n'
+              + `可用项：${roster.map((p) => p.id).join(' / ')}（内置回退）——/mode <id> 仍可切换。`)
+            return
+          }
+          await runtime.channel.send(msg.chatId, { card: modePickerCard(currentModeId(runtime, msg.chatId), roster) }, {})
+          return
+        }
+        const preset = roster.find((p) => p.id === argText)
+        if (preset === undefined) {
+          await cmdReply(msg, `⚠️ 未知模式「${argText}」（可用：${roster.map((p) => p.id).join(' / ')}）。`)
+          return
+        }
+        if (preset.broken !== undefined) {
+          await cmdReply(msg, `⚠️ 模式「${presetLabel(preset)}」当前不可用（${preset.broken}）。`)
+          return
+        }
+        await switchChatMode(runtime, msg, preset)
       },
     },
     effort: {
