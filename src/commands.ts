@@ -11,6 +11,17 @@
  * catalog + per-chat preference applied on the next turn), and /resume
  * (sessions.list / agents.roots / sessionPersistence history with
  * latest-answer excerpts, switching via agents.resume).
+ *
+ * 命令三级分流（借鉴自 amlyczz/dsh-lark-link (MIT)
+ * src/application/command-router.ts 的设计，化用为本机命令表结构）：
+ *   Tier 1 桥命令：COMMANDS 表命中 → 现有处理（路径不变）；
+ *   Tier 2 DSH 宿主注册命令：未知 /xxx 先查 host commands 服务
+ *     （setCommandsHost 注入；find/execute 语义对齐 @deepseek-ai/dsh-commands
+ *      CommandRuntime），命中则原生执行并把结果文本回给聊天；
+ *   Tier 3 注入：未命中命令转发给 agent（setAgentFallback 注入；index.ts
+ *     接线为 processNormalText 后生效），未接线时保持原「未知命令」回复，
+ *     保证现有行为零回归。
+ * 两个注入点均为本模块级扩展，不改变 CommandRuntime / CommandRunner 契约。
  */
 
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk'
@@ -87,6 +98,61 @@ export interface CommandRuntime {
 /** Dispatcher handle() uses for any text starting with '/'. */
 export interface CommandRunner {
   runCommand(msg: NormalizedMessage, text: string): Promise<void>
+}
+
+// ------------------------------------------------------------ Tier 2/3 host wiring
+/**
+ * Structural mirror of the host commands service (packages/interaction/commands
+ * CommandRuntime) — the plugin does not import @deepseek-ai/dsh-commands
+ * (undeclared dependency; same mirroring policy as src/types.ts). The real
+ * service is structurally compatible: find resolves one definition, execute
+ * parses a complete slash-command line and runs the handler natively (never
+ * sent to the model), resolving undefined when syntax/name does not resolve.
+ */
+export interface BridgeCommandsHost {
+  /** Resolve a registered command by name (no leading slash); undefined = not registered. */
+  find(agent: BridgeAgent, name: string): unknown
+  /** Parse and execute a full slash-command line; undefined = syntax/name miss. */
+  execute(
+    agent: BridgeAgent,
+    line: string,
+    signal: AbortSignal,
+  ): Promise<BridgeCommandExecution | undefined>
+}
+
+/** One settled host command execution (mirror of CommandExecution). */
+export interface BridgeCommandExecution {
+  commandId: string
+  result: BridgeCommandResult
+}
+
+/** Handler outcome (mirror of CommandResult): success carries optional reply text, error carries a message. */
+export type BridgeCommandResult =
+  | { kind: 'success'; text?: string; sourceEventSeq?: number }
+  | { kind: 'error'; text: string }
+
+/** Tier-3 injection target: forward an unhandled slash line into the agent (index.ts wires processNormalText). */
+export type AgentInjection = (msg: NormalizedMessage, text: string) => Promise<void>
+
+let commandsHost: BridgeCommandsHost | undefined
+let agentFallback: AgentInjection | undefined
+
+/**
+ * Tier-2 wiring point (called by index.ts at apply time, before any message):
+ * setCommandsHost(ctx.get('commands') as BridgeCommandsHost | undefined).
+ * undefined disables Tier 2 (host commands service not assembled).
+ */
+export function setCommandsHost(host: BridgeCommandsHost | undefined): void {
+  commandsHost = host
+}
+
+/**
+ * Tier-3 wiring point (called by index.ts at apply time): forward unhandled
+ * slash lines into the agent (processNormalText). undefined keeps the legacy
+ * "unknown command" reply — no behavior regression when unwired.
+ */
+export function setAgentFallback(fallback: AgentInjection | undefined): void {
+  agentFallback = fallback
 }
 
 /** One command row of the COMMANDS table. */
@@ -368,7 +434,11 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
       async run(msg) {
         const lines = ['可用命令：']
         for (const [cmdName, cmd] of Object.entries(COMMANDS)) lines.push(`/${cmdName} — ${cmd.desc}`)
-        lines.push('（其他以 / 开头的内容视为命令；想发给 AI 用 /ai <内容>）')
+        if (commandsHost !== undefined) {
+          lines.push('（DSH 宿主注册的命令如 /goal 会直接执行；其余以 / 开头的内容视为命令）')
+        } else {
+          lines.push('（其他以 / 开头的内容视为命令；想发给 AI 用 /ai <内容>）')
+        }
         await cmdReply(msg, lines.join('\n'))
       },
     },
@@ -710,22 +780,67 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
     },
   }
 
+  /**
+   * Tier 2: execute a host-registered command natively (no model round-trip).
+   * Requires the host service (setCommandsHost) and a live chat agent — the
+   * command runs against the chat's session. Returns true when consumed.
+   */
+  async function runHostCommand(
+    msg: NormalizedMessage,
+    text: string,
+    cmdName: string,
+    arg: string,
+  ): Promise<boolean> {
+    const host = commandsHost
+    if (host === undefined) return false
+    const agent = runtime.getAgent(msg.chatId)
+    if (agent === undefined) return false
+    try {
+      if (host.find(agent, cmdName) === undefined) return false
+      // Rebuild a normalized lowercase line: host parseCommand requires
+      // /[a-z][a-z0-9_-]*/, so an uppercase /Goal must not silently miss.
+      const line = `/${cmdName}${arg !== '' ? ` ${arg}` : ''}`
+      const execution = await host.execute(agent, line, new AbortController().signal)
+      if (execution === undefined) return false // syntax/name race — Tier 3
+      const result = execution.result
+      if (result.kind === 'success') {
+        if (result.text !== undefined && result.text !== '') await cmdReply(msg, result.text)
+      } else {
+        await cmdReply(msg, `⚠️ ${result.text}`)
+      }
+      return true
+    } catch (error) {
+      // Handler failure: never wedge the chat — fall through to Tier 3.
+      runtime.log(`host command /${cmdName} failed:`, errorMessage(error))
+      return false
+    }
+  }
+
   async function runCommand(msg: NormalizedMessage, text: string): Promise<void> {
     const parts = text.slice(1).split(/\s+/)
     const raw = parts[0] ?? ''
     const cmdName = raw.toLowerCase()
     const arg = parts.slice(1).join(' ').trim()
     const cmd = COMMANDS[cmdName]
-    if (cmd === undefined) {
-      await cmdReply(msg, `未知命令 /${cmdName}。输入 /help 查看可用命令；想把内容发给 AI，用 /ai <内容>。`)
+    if (cmd !== undefined) {
+      // Tier 1: bridge command — existing handling, unchanged.
+      try {
+        await cmd.run(msg, arg)
+      } catch (error) {
+        runtime.log(`command /${cmdName} failed:`, errorMessage(error))
+        await cmdReply(msg, `⚠️ 命令执行失败：${errorMessage(error).slice(0, 200)}`)
+      }
       return
     }
-    try {
-      await cmd.run(msg, arg)
-    } catch (error) {
-      runtime.log(`command /${cmdName} failed:`, errorMessage(error))
-      await cmdReply(msg, `⚠️ 命令执行失败：${errorMessage(error).slice(0, 200)}`)
+    // Tier 2: DSH host-registered command (e.g. /goal) — native execution.
+    if (await runHostCommand(msg, text, cmdName, arg)) return
+    // Tier 3: injection into the agent (wired by index.ts); unwired keeps the
+    // legacy unknown-command reply — zero regression.
+    if (agentFallback !== undefined) {
+      await agentFallback(msg, text)
+      return
     }
+    await cmdReply(msg, `未知命令 /${cmdName}。输入 /help 查看可用命令；想把内容发给 AI，用 /ai <内容>。`)
   }
 
   return { runCommand }
