@@ -1,6 +1,6 @@
 /**
  * Durable per-chat state: chatEpochs / chatSessionList / chatWorkspaces /
- * chatEffortPrefs / chatPermissionTiers persisted to
+ * chatEffortPrefs / chatPermissionTiers / chatModes persisted to
  * ~/.dsh/dsh-feishu-bridge/state.json.
  */
 import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
@@ -31,6 +31,13 @@ export interface BridgeState {
    * saveState 总是保留磁盘上的该字段——见 saveState 注释）。
    */
   chatPermissionTiers: Record<string, PermissionTier>
+  /**
+   * Per-chat agent-mode (agentPreset id) preference set by /mode（P2.5）。
+   * 由 commands.ts 经 saveChatMode 独占维护，独占写模式同
+   * chatPermissionTiers（index.ts 的持久化视图不含最新值，saveState
+   * 总是保留磁盘上的该字段——见 saveState 注释）。
+   */
+  chatModes: Record<string, string>
 }
 
 /** Read the current on-disk state verbatim ({} on missing/corrupt file). */
@@ -52,6 +59,7 @@ export function loadState(): BridgeState {
     chatSessionOverride: parsed.chatSessionOverride ?? {},
     chatEffortPrefs: parsed.chatEffortPrefs ?? {},
     chatPermissionTiers: parsed.chatPermissionTiers ?? {},
+    chatModes: parsed.chatModes ?? {},
   }
 }
 
@@ -82,6 +90,9 @@ function writeStateFile(merged: BridgeState): void {
  * state 对象）永远不会包含最新值——若按常规以传入值为准，index.ts 的任意一次
  * persist() 都会把该字段回写成启动时的陈旧快照，/permission 的持久化即失效。
  * 因此这里总是以磁盘上的最新值为准（读改写闭环在 savePermissionTier 内完成）。
+ *
+ * chatModes 例外同理（P2.5 /mode）：由 commands.ts 经 saveChatMode 独占写入，
+ * 这里同样保留磁盘最新值。
  */
 export function saveState(state: BridgeState): void {
   const disk = readDiskState()
@@ -89,6 +100,7 @@ export function saveState(state: BridgeState): void {
     ...disk,
     ...state,
     chatPermissionTiers: (disk.chatPermissionTiers ?? {}) as Record<string, PermissionTier>,
+    chatModes: (disk.chatModes ?? {}) as Record<string, string>,
   })
 }
 
@@ -108,6 +120,28 @@ export function savePermissionTier(chatId: string, tier: PermissionTier): void {
     chatSessionOverride: disk.chatSessionOverride ?? {},
     chatEffortPrefs: disk.chatEffortPrefs ?? {},
     chatPermissionTiers: tiers,
+    chatModes: (disk.chatModes ?? {}) as Record<string, string>,
+  })
+}
+
+/**
+ * 写入一个 chat 的 Agent 模式偏好（P2.5 /mode 专用写路径）：读磁盘最新值 →
+ * 改一个 key → 原子落盘。与 saveState 的「保留磁盘 chatModes」约定互补，
+ * 保证该字段不被 index.ts 的陈旧持久化视图覆盖（独占写模式同
+ * savePermissionTier；写路径里同样带全量字段，避免丢其他键）。
+ */
+export function saveChatMode(chatId: string, presetId: string): void {
+  const disk = readDiskState()
+  const modes = { ...(disk.chatModes ?? {}) }
+  modes[chatId] = presetId
+  writeStateFile({
+    chatEpochs: disk.chatEpochs ?? {},
+    chatSessionList: disk.chatSessionList ?? {},
+    chatWorkspaces: disk.chatWorkspaces ?? {},
+    chatSessionOverride: disk.chatSessionOverride ?? {},
+    chatEffortPrefs: disk.chatEffortPrefs ?? {},
+    chatPermissionTiers: (disk.chatPermissionTiers ?? {}) as Record<string, PermissionTier>,
+    chatModes: modes,
   })
 }
 
