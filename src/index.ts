@@ -16,6 +16,10 @@ import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk'
 import type { Context } from 'cordis'
 import z from 'schemastery'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { createOutbox } from './outbox.js'
+import { createWal, type WalRecord } from './wal.js'
 import { createBatcher } from './batching.js'
 import { registerApproval } from './approval.js'
 import { registerCommands, renderStatus, type CommandRuntime } from './commands.js'
@@ -64,6 +68,10 @@ export interface Config {
   maxReplyChars: number
   /** 消息突发批处理窗口（ms）：窗口内同一聊天的连续普通消息合并为一条进 DSH；0 = 禁用。 */
   batchWindowMs: number
+  /** 入站单条消息长度上限（字符）：超出截断并提示（0 = 不限制）。 */
+  maxMessageChars: number
+  /** 入站限流：每 chat 每分钟消息数上限（agent 注入前防护；0 = 不限制）。 */
+  rateLimitPerMinute: number
 }
 
 export const Config = z.object({
@@ -76,6 +84,8 @@ export const Config = z.object({
   streamThrottleChars: z.number().default(12),
   maxReplyChars: z.number().default(4000),
   batchWindowMs: z.number().min(0).default(800),
+  maxMessageChars: z.number().min(0).default(20_000),
+  rateLimitPerMinute: z.number().min(0).default(30),
 })
 
 /** One-line error text from any thrown value. */
@@ -243,7 +253,8 @@ export function apply(ctx: Context, config: Config): void {
 interface BridgeRuntime {
   log(...args: unknown[]): void
   onGlobalSessionEvent(sessionId: string, event: BridgeSessionEvent): void
-  handle(msg: NormalizedMessage): Promise<void>
+  /** opts.replayed = 入站补发重放：跳过入站过滤/命令解析/限流/WAL accept。 */
+  handle(msg: NormalizedMessage, opts?: { replayed?: boolean }): Promise<void>
   connectChannel(): Promise<void>
   dispose(): void
 }
@@ -262,6 +273,29 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   /** Stable base epoch (web-mode semantics: session ids survive restarts). */
   const EPOCH = '0'
   const STARTED_AT = Date.now()
+
+  // ------------------------------------------------------------ P0 reliability: outbox + inbound WAL
+  // 入站 WAL：注入 agent 之前落盘，回复确认送达后记账；崩溃/重载后可补发。
+  const wal = createWal({ dir: join(homedir(), '.dsh', 'dsh-feishu-bridge', 'wal') })
+  // 出站 Outbox：回复投递走持久化队列（at-least-once）。deliver 注入 channel.send，
+  // 成功即触发该消息的 WAL delivered（"回复已送达"是补发语义的终点）。
+  const outbox = createOutbox({
+    dir: join(homedir(), '.dsh', 'dsh-feishu-bridge', 'outbox'),
+    deliver: async (env) => {
+      const p = env.payload
+      if (p === undefined) return { ok: false, retryable: false, error: 'payload unresolved (blob missing)' }
+      try {
+        const input = p.kind === 'card' && p.card !== undefined ? { card: p.card } : { text: p.text ?? '' }
+        await channel.send(p.chatId, input, p.replyTo !== undefined ? { replyTo: p.replyTo } : {})
+        if (p.sourceMessageId !== undefined) markDelivered(p.sourceMessageId)
+        return { ok: true }
+      } catch (error) {
+        return { ok: false, retryable: true, error: errorMessage(error) }
+      }
+    },
+  })
+  outbox.rebuildFromDisk() // sending → pending：崩溃/重载/凭据重建后恢复投递
+  outbox.start()
 
   function log(...args: unknown[]): void {
     console.error(`[${name} ${new Date().toISOString().slice(11, 19)}]`, ...args)
@@ -671,6 +705,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
           }
         },
       }, { replyTo: msg.messageId })
+      // 流式回复确认送达 → WAL delivered：该用户消息不再需要补发。
+      markDelivered(msg.messageId)
       // Completed turn: patch interrupt note + token footer onto the card.
       if (streamed.trim() !== '') {
         await appendTokenFooter(msg.chatId, messageId, streamed, interrupted)
@@ -678,9 +714,12 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     } catch (error) {
       if (error instanceof TurnTimeoutError) throw error
       log('stream failed:', errorMessage(error))
-      try {
-        await channel.send(msg.chatId, { text: `⚠️ 处理失败：${errorMessage(error).slice(0, 300)}` }, { replyTo: msg.messageId })
-      } catch { /* already tried */ }
+      // P0：兜底错误通知走 Outbox（at-least-once），送达即 WAL delivered。
+      const id = enqueueDurable({
+        chatId: msg.chatId, kind: 'text', text: `⚠️ 处理失败：${errorMessage(error).slice(0, 300)}`,
+        replyTo: msg.messageId, dedupeKey: `notice:${msg.messageId}`, sourceMessageId: msg.messageId,
+      })
+      if (id === undefined) markDelivered(msg.messageId)
     }
   }
 
@@ -714,16 +753,99 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   }
 
   /**
+   * P0 出站 Outbox：把回复投递进持久化队列（at-least-once —— 失败重试、重启
+   * 恢复、幂等键防重复投递）。返回 envelope id；undefined = 幂等键已投递过
+   * （此时回复必然已送达，调用方应直接记账 delivered）或队列满拒绝。
+   */
+  function enqueueDurable(input: {
+    chatId: string
+    kind: 'text' | 'card'
+    text?: string
+    card?: object
+    replyTo?: string
+    dedupeKey: string
+    sourceMessageId?: string
+  }): string | undefined {
+    try {
+      return outbox.enqueue({
+        dedupeKey: input.dedupeKey,
+        laneKey: input.chatId,
+        kind: input.kind,
+        payload: {
+          chatId: input.chatId,
+          kind: input.kind,
+          ...(input.text !== undefined ? { text: input.text } : {}),
+          ...(input.card !== undefined ? { card: input.card } : {}),
+          ...(input.replyTo !== undefined ? { replyTo: input.replyTo } : {}),
+          ...(input.sourceMessageId !== undefined ? { sourceMessageId: input.sourceMessageId } : {}),
+        },
+      })
+    } catch (error) {
+      log('outbox enqueue failed:', errorMessage(error))
+      return undefined
+    }
+  }
+
+  /** WAL 记账：该用户消息的回复已确认送达，不再需要补发。 */
+  function markDelivered(messageId: string): void {
+    try {
+      wal.delivered(messageId)
+    } catch (error) {
+      log('wal delivered failed:', errorMessage(error))
+    }
+  }
+
+  // P0 入站限流：每 chat 每分钟消息数上限（滑动窗口，agent 注入前防护）。
+  const chatMsgTimes = new Map<string, number[]>()
+  /** 限流提示节流：同 chat 每 5s 至多一条丢弃提示，避免提示本身刷屏。 */
+  const chatRateNoticeAt = new Map<string, number>()
+
+  /** 滑动窗口（60s）计数；超限返回 false（config 为 0 = 不限制）。 */
+  function rateLimitAllowed(chatId: string): boolean {
+    if (config.rateLimitPerMinute <= 0) return true
+    const cutoff = Date.now() - 60_000
+    const times = (chatMsgTimes.get(chatId) ?? []).filter((t) => t >= cutoff)
+    if (times.length >= config.rateLimitPerMinute) {
+      chatMsgTimes.set(chatId, times)
+      return false
+    }
+    times.push(Date.now())
+    chatMsgTimes.set(chatId, times)
+    return true
+  }
+
+  /** 丢弃提示（节流版）：超频时告知用户，不静默吞消息。 */
+  function rateLimitNotice(msg: NormalizedMessage): void {
+    const now = Date.now()
+    const last = chatRateNoticeAt.get(msg.chatId) ?? 0
+    if (now - last < 5_000) return
+    chatRateNoticeAt.set(msg.chatId, now)
+    void cmdReply(msg, `⚠️ 消息太频繁（每分钟最多 ${config.rateLimitPerMinute} 条），本条已丢弃，请稍后再试。`).catch(() => {})
+  }
+
+  /**
    * One plain message through the existing reply pipeline: queue/steer mode,
    * interrupt-if-slow, user transcript, then the streaming or one-shot card
    * branch. Shared by immediate (forced-mode / /ai / batching-disabled)
    * messages and by batched flushes.
+   * @param opts.replayed - 入站补发重放：不再 accept（避免重置补发次数上限）。
    */
   async function processNormalText(
     msg: NormalizedMessage,
     text: string,
     forced: 'queue' | 'steer' | undefined,
+    opts: { replayed?: boolean } = {},
   ): Promise<void> {
+    // P0 入站 WAL：注入 agent 之前落盘（崩溃/重载后补发；批处理合并文本时
+    // 只记一条 —— messageId 取 flush 携带的最后一条消息，text 为合并全文，
+    // 补发重放的就是同一回合）。
+    if (!opts.replayed) {
+      try {
+        wal.accept({ messageId: msg.messageId, chatKey: msg.chatId, text })
+      } catch (error) {
+        log('wal accept failed:', errorMessage(error))
+      }
+    }
     const mode = messageMode(msg.chatId, forced)
     // Queue mode: never interrupt the running turn. Steer mode (default): cut in line.
     if (mode === 'steer') await interruptIfSlow(msg.chatId)
@@ -741,26 +863,37 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     }
 
     // Non-streaming fallback: one-shot card (no typewriter), keeps interrupt note
-    // and cumulative-token footer.
+    // and cumulative-token footer. P0：回复走 Outbox（at-least-once）；投递成功
+    // 即 WAL delivered（deliver 注入钩子），enqueue 幂等短路时直接记账。
     try {
       const result = await enqueue(msg.chatId, () => thinkTurn(msg.chatId, text, undefined, mode))
       const answer = result.text
       recordTranscript(msg.chatId, 'assistant', answer)
       if (answer.trim() === '') {
-        await channel.send(msg.chatId, { text: '⚠️ DSH 没有产生回复（可能出错了）。' }, { replyTo: msg.messageId })
+        const id = enqueueDurable({
+          chatId: msg.chatId, kind: 'text', text: '⚠️ DSH 没有产生回复（可能出错了）。',
+          replyTo: msg.messageId, dedupeKey: `notice:${msg.messageId}`, sourceMessageId: msg.messageId,
+        })
+        if (id === undefined) markDelivered(msg.messageId)
       } else {
         const usage = readCumulativeUsage(msg.chatId)
         const body = result.blocked
           ? `${truncate(answer, config.maxReplyChars)}\n\n⚠️ 该请求需要交互，请在 Web GUI 处理。`
           : truncate(answer, config.maxReplyChars)
-        await channel.send(msg.chatId, { card: replyCard(body, result.interrupted, usage) }, { replyTo: msg.messageId })
+        const id = enqueueDurable({
+          chatId: msg.chatId, kind: 'card', card: replyCard(body, result.interrupted, usage),
+          replyTo: msg.messageId, dedupeKey: `reply:${msg.messageId}`, sourceMessageId: msg.messageId,
+        })
+        if (id === undefined) markDelivered(msg.messageId)
       }
     } catch (error) {
       if (error instanceof TurnTimeoutError) { await handleTimeout(msg); return }
       log('turn failed:', errorMessage(error))
-      try {
-        await channel.send(msg.chatId, { text: `⚠️ 处理失败：${errorMessage(error).slice(0, 300)}` }, { replyTo: msg.messageId })
-      } catch { /* already tried */ }
+      const id = enqueueDurable({
+        chatId: msg.chatId, kind: 'text', text: `⚠️ 处理失败：${errorMessage(error).slice(0, 300)}`,
+        replyTo: msg.messageId, dedupeKey: `notice:${msg.messageId}`, sourceMessageId: msg.messageId,
+      })
+      if (id === undefined) markDelivered(msg.messageId)
     }
   }
 
@@ -783,14 +916,34 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
       })
     : undefined
 
-  async function handle(msg: NormalizedMessage): Promise<void> {
-    const botOpenId = channel.botIdentity?.openId
-    if (msg.senderId === botOpenId) return
-    if (msg.chatType === 'group' && !msg.mentionedBot) return
+  /**
+   * 入站消息入口。opts.replayed = 入站补发重放：该消息当初已通过过滤/限流，
+   * 重放只重跑注入管线（跳过过滤、命令解析、限流，也不重复 WAL accept）。
+   */
+  async function handle(msg: NormalizedMessage, opts: { replayed?: boolean } = {}): Promise<void> {
+    if (!opts.replayed) {
+      const botOpenId = channel.botIdentity?.openId
+      if (msg.senderId === botOpenId) return
+      if (msg.chatType === 'group' && !msg.mentionedBot) return
+    }
 
     let text = stripMentions(msg)
     if (text === '') return
     log(`message ${msg.messageId} chat=${msg.chatId} type=${msg.chatType} from=${msg.senderId}: ${text.slice(0, 80)}`)
+
+    // P0 入站限流 1/2：单条消息长度上限（超出截断 + 提示；0 = 不限制）。
+    if (config.maxMessageChars > 0 && text.length > config.maxMessageChars) {
+      text = text.slice(0, config.maxMessageChars)
+      void cmdReply(msg, `⚠️ 消息过长（超过 ${config.maxMessageChars} 字符），已截断为前 ${config.maxMessageChars} 字符处理。`).catch(() => {})
+    }
+
+    // 补发重放：原始文本已是注入内容（记录时即 post-解析），直接走注入管线；
+    // 放在问答消费之前 —— 重放文本必为 agent 注入消息（问答答案从未 WAL 记账），
+    // 避免被 pending 问答卡误吞。
+    if (opts.replayed) {
+      await processNormalText(msg, text, undefined, { replayed: true })
+      return
+    }
 
     // A pending no-option question consumes the raw text as its answer.
     if (await questions.answerPendingFreeText(msg.chatId, text)) return
@@ -818,6 +971,13 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
       text = prompt
     } else if (text.startsWith('/')) {
       enqueueCommand(msg.chatId, () => runCommand(msg, text))
+      return
+    }
+
+    // P0 入站限流 2/2：每 chat 每分钟消息数上限（agent 注入前防护）。命令已在
+    // 上面 return，此处只拦 agent 注入路径（普通消息 / /ai / /squeeze / /steer）。
+    if (!rateLimitAllowed(msg.chatId)) {
+      rateLimitNotice(msg)
       return
     }
 
@@ -1015,11 +1175,57 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
 
   const questions = registerQuestions({ ctx, channel, chatIdForSession, log })
 
+  /** 把 WAL 记录合成一条可重放的入站消息（replayed 旁路跳过全部入站过滤）。 */
+  function replayMessage(rec: WalRecord): NormalizedMessage {
+    return {
+      messageId: rec.messageId,
+      chatId: rec.chatKey,
+      chatType: 'p2p',
+      senderId: '',
+      content: rec.text,
+      rawContentType: 'text',
+      resources: [],
+      mentions: [],
+      mentionAll: false,
+      mentionedBot: true,
+      createTime: rec.acceptedAt,
+    }
+  }
+
   /** YOLO 免审批查询：该 chat 开启 /yolo 后审批帧自动放行（approval.ts 消费）。 */
   function isYolo(chatId: string): boolean {
     return chatYoloPrefs.get(chatId) === true
   }
   const approvals = registerApproval({ ctx, channel, chatIdForSession, isYolo, log })
+
+  // ---- P0 入站补发对账（启动流程末尾，fire-and-forget）--------------------------
+  // accepted 而未 delivered 的记录 = 上次进程/插件在回合中途死掉，用户消息被吞。
+  // 窗口内（30min）、次数未超（2 次）的重新派发 —— handle 的 replayed 旁路不再
+  // 重跑过滤/命令解析/限流、也不重复 accept；回复走 Outbox 依旧 at-least-once。
+  // 调用点：首次连接成功后（connectChannel 的 firstConnectDone 分支），与
+  // lark-link 的「supervisor 连接建立后再对账」一致 —— 连接未就绪时流式卡片
+  // 会直接失败，补发只会产出错误通知而非真正的回复。fire-and-forget，不阻塞。
+  function runInboundReplay(): void {
+    void (async () => {
+      try {
+        wal.prune()
+        const pending = wal.pendingReplays()
+        let replayed = 0
+        for (const rec of pending) {
+          if (!wal.markReplay(rec.messageId)) continue
+          try {
+            await handle(replayMessage(rec), { replayed: true })
+            replayed++
+          } catch (error) {
+            log(`inbound replay failed for ${rec.messageId}:`, errorMessage(error))
+          }
+        }
+        if (replayed > 0) log(`inbound replay re-dispatched ${replayed} request(s)`)
+      } catch (error) {
+        log('inbound replay errored:', errorMessage(error))
+      }
+    })()
+  }
 
   // ------------------------------------------------------------ lifecycle
   let connectRetryTimer: NodeJS.Timeout | undefined
@@ -1038,6 +1244,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
       if (!firstConnectDone) {
         firstConnectDone = true
         void notifyRestarted()
+        // P0：连接就绪后再补发入站请求（见 runInboundReplay 注释）。
+        runInboundReplay()
       }
     } catch (error) {
       log('channel connect failed (will retry):', errorMessage(error))
@@ -1081,6 +1289,9 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     try { questions.dispose() } catch { /* already gone */ }
     try { approvals.dispose() } catch { /* already gone */ }
     batcher?.dispose()
+    // P0：停 outbox 泵（等 in-flight 投递收敛；未投递的 envelope 已在磁盘，
+    // 下次启动/重建后由 rebuildFromDisk 恢复）。
+    void outbox.stop().catch(() => { /* already stopped */ })
     void channel.disconnect().catch(() => { /* already gone */ })
   }
 
