@@ -2,7 +2,7 @@
  * Durable per-chat state: chatEpochs / chatSessionList / chatWorkspaces /
  * chatEffortPrefs persisted to ~/.dsh/dsh-feishu-bridge/state.json.
  */
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -35,10 +35,25 @@ export function loadState(): BridgeState {
   }
 }
 
-/** Write the full state back (sync write, JSON 2-space). */
+/**
+ * 写全量 state：目录自动创建；先写临时文件再 rename 原子落盘（避免半截
+ * JSON —— 直写目标文件时写一半崩溃会让 loadState 静默回默认、丢掉全部
+ * 会话绑定）；权限强制 0600。rename 失败（罕见）退化为直接写目标文件。
+ * （原子写风格仿 src/setup.ts 的凭据落盘；setup.ts 同款写法。）
+ */
 export function saveState(state: BridgeState): void {
-  mkdirSync(dirname(STATE_FILE), { recursive: true })
-  writeFileSync(STATE_FILE, JSON.stringify(state, null, 2))
+  const dir = dirname(STATE_FILE)
+  mkdirSync(dir, { recursive: true })
+  const text = `${JSON.stringify(state, null, 2)}\n`
+  const tmp = join(dir, `.state.tmp-${process.pid}`)
+  writeFileSync(tmp, text, { mode: 0o600 })
+  try {
+    renameSync(tmp, STATE_FILE)
+  } catch {
+    writeFileSync(STATE_FILE, text, { mode: 0o600 })
+    try { unlinkSync(tmp) } catch { /* already gone */ }
+  }
+  try { chmodSync(STATE_FILE, 0o600) } catch { /* best effort */ }
 }
 
 /**
