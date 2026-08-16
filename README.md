@@ -4,7 +4,7 @@
 
 ![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)
 ![Platform](https://img.shields.io/badge/platform-DeepSeek%20Harness%20(DSH)-4B32C3)
-![Version](https://img.shields.io/badge/version-0.2.0-brightgreen)
+![Version](https://img.shields.io/badge/version-0.3.0-brightgreen)
 ![Language](https://img.shields.io/badge/language-TypeScript-3178C6)
 ![Messaging](https://img.shields.io/badge/feishu-lark-3370FF)
 
@@ -28,7 +28,8 @@ DSH（DeepSeek Harness）的进程内 Cordis 插件：飞书 IM 收发消息，�
 - 🧠 **思考强度调节**：`/effort` 查看当前模型支持的思考档位，`/effort <档位>` 切换，下一回合生效、偏好持久化。
 - 🎛️ **命令卡片化**：`/model` 无参数升级为单选按钮卡——按供应商分组、点击即切（下一回合生效），原文本列表保留为 `/model list`，`/model <序号>` 直切不变。
 - 🏥 **一键诊断包 `/doctor`**：收集当前会话完整 session log（与 WebUI「Session log」下载同源，live 会话先 flush 落盘）+ 脱敏配置（凭据 / 密钥 / token 打码）+ ISSUE.md（插件与 DSH 版本 / 系统 / 状态快照 / 症状模板）→ fflate 打包 ZIP（日志 8MB 截断、ZIP 10MB 超限裁日志）→ 发回飞书；单项收集失败写入 ISSUE.md「收集失败」节，不阻塞出包。
-- ⌨️ **斜杠命令**：19 个命令覆盖模型切换、思考强度、工作区管理、会话恢复、流式开关、免审批模式、权限档位、诊断包、扫码配置等（见下方命令表）。
+- 🎭 **多模式 Agent 切换 `/mode`**：单选卡枚举宿主 `agentPresets` 实时预设（服务不可达安静降级为内置 standard，不抛异常），点击或 `/mode <id>` 即切；偏好持久化（state.json `chatModes`，独占写，重启恢复）；切换即重置当前会话（epoch+1，旧会话行保留）；新会话创建自动按 chat 偏好应用预设（回落部署 defaultId → standard）。
+- ⌨️ **斜杠命令**：20 个命令覆盖模型切换、多模式 Agent 切换、思考强度、工作区管理、会话恢复、流式开关、免审批模式、权限档位、诊断包、扫码配置等（见下方命令表）。
 - 🚦 **命令三级分流**：桥特有命令 → DSH 宿主注册命令（如 `/goal`，原生执行不走模型）→ 未知 `/xxx` 与普通消息原样注入 Agent，三级自动分流，命令与对话互不误伤。
 - 🔀 **每会话串行队列 + 插队**：同一聊天内消息按序处理；新消息可打断运行中的慢回合（阈值可配），也可强制排队。
 - 🐕 **看门狗**：单回合超过时限自动取消该回合并回复错误卡片，**绝不退出进程**。
@@ -93,9 +94,9 @@ flowchart LR
 
 | 模块 | 职责 |
 | --- | --- |
-| `src/index.ts` | 插件入口与核心运行时：消息入口、每 chat 串行队列与插队、看门狗、流式 / 非流式回复管线、入站媒体分流与附件注入、Outbox / WAL / 配额熔断 / 表情回执接线、生命周期 |
+| `src/index.ts` | 插件入口与核心运行时：消息入口、每 chat 串行队列与插队、看门狗、流式 / 非流式回复管线、入站媒体分流与附件注入、Outbox / WAL / 配额熔断 / 表情回执接线、agent 预设解析链（chatModes 偏好 → 部署 defaultId → standard）、生命周期 |
 | `src/lark.ts` | 飞书 Channel：WebSocket 长连接、消息去重、聊天队列、陈旧消息窗口、流式卡片节流 |
-| `src/commands.ts` | 斜杠命令表与三级分流（Tier 1 桥命令 / Tier 2 宿主注册命令原生执行 / Tier 3 注入 Agent）；P2 卡片化命令：/model 单选卡、/permission 三级权限卡、/doctor 接线与卡片回调路由 |
+| `src/commands.ts` | 斜杠命令表与三级分流（Tier 1 桥命令 / Tier 2 宿主注册命令原生执行 / Tier 3 注入 Agent）；卡片化命令：/model 单选卡、/permission 三级权限卡、/doctor 接线、/mode 单选卡与卡片回调路由（cmd\|model\| / cmd\|perm\| / cmd\|mode\|） |
 | `src/outbox.ts` | 出站 Outbox：JSONL 分段 + 原子落盘、幂等键防重复投递、分航道 FIFO、有界指数退避、终态自清理、超长 payload 溢出 blobs/ |
 | `src/wal.ts` | 入站 WAL：注入前落盘、delivered 记账、启动对账补发（2 次 / 30 分钟窗口上限） |
 | `src/reactions.ts` | 表情回执：飞书实测 emoji 白名单过滤、随机「已收到」池、DONE 完成标记 |
@@ -107,8 +108,12 @@ flowchart LR
 | `src/media.ts` | 入站多媒体（P2）：图片下载 → attachment 存储（ImageBlock）/ 本地落盘，文件有界文本提取（150KB + 8000 字符）或元信息注记，401/403 安静降级 |
 | `src/send-file.ts` | 出站文件工具 `lark_send_local_file`（P2）：会话反查、realpath 白名单目录、20MB / 扩展名白名单、图片走 image 消息其余走 file 消息 |
 | `src/doctor.ts` | /doctor 诊断包（P2）：session log 收集（live 先 flush）+ 脱敏配置 + ISSUE.md，fflate ZIP 打包发送 |
-| `src/state.ts` | 状态持久化：会话代次 / 会话列表 / 工作区绑定 / 会话覆盖 / 权限档（chatPermissionTiers，原子落盘 0600） |
+| `src/state.ts` | 状态持久化：会话代次 / 会话列表 / 工作区绑定 / 会话覆盖 / 权限档（chatPermissionTiers）/ /mode 模式偏好（chatModes，saveChatMode 独占写，原子落盘 0600） |
 | `src/text.ts` | 文本处理：@ 提及剥离、超长截断、token 数量格式化 |
+
+## ✅ 测试
+
+正式单元测试（vitest，**193 用例全绿**）：`npm test` 一键运行，测试代码独立 tsc 编译（`test/tsconfig.json`）。覆盖 outbox / wal / state / questions / reactions / markdown-card / quota / command-router / media / send-file / doctor / permission / mode 全部核心模块。
 
 ## 🚀 快速开始
 
@@ -315,6 +320,7 @@ export FEISHU_APP_SECRET="xxxxxxxxxxxxxxxx"
 | `/new` | — | 同 `/reset`，开启新会话 |
 | `/workspace` | `[序号 \| 路径]` | 列出 / 切换工作区；`/workspace 0` 解除绑定（未分组，宿主默认 cwd）；`<路径>` 为已存在目录时自动创建并绑定；切换即开新会话（记忆清空） |
 | `/model` | `list \| [序号]` | 无参数 = 单选按钮卡（按供应商分组，点击即切）；`/model list` = 文本列表；`/model <序号>` = 直接切换（下一回合生效，记忆保留） |
+| `/mode` | `[id]` | 无参数 = 单选卡（枚举 agentPresets 实时预设，显示名用预设 name，点击即切）；`/mode <id>` 直接切换；切换即重置当前会话（epoch+1，旧会话行保留）；偏好持久化 state.json `chatModes`，重启恢复；新会话自动按 chat 偏好应用预设（回落 defaultId → standard）；预设服务不可达时安静降级为内置 standard |
 | `/effort` | `[档位]` | 查看/切换思考强度：/effort 或 /effort <档位> |
 | `/stream` | `on \| off` | 本会话流式回复开关（无参查看当前状态） |
 | `/cancel` | — | 取消当前运行中的回合（回合卡住时自救） |
