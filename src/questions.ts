@@ -26,6 +26,8 @@ import type { Context } from 'cordis'
 const QUESTION_TTL_MS = 10 * 60 * 1000
 /** 过期回收扫描周期。 */
 const REAPER_INTERVAL_MS = 60 * 1000
+/** mux 断流重订阅退避（仿 src/approval.ts 的 MUX_RETRY_MS）。 */
+const MUX_RETRY_MS = 2000
 
 // ---------------------------------------------------------------------------
 // apiproxy 契约的进程内视图（结构镜像，不 import @deepseek-ai/dsh-host-apiproxy
@@ -185,6 +187,8 @@ export function registerQuestions(runtime: QuestionRuntime): QuestionBridge {
   const disposers: Array<() => void> = []
   let started = false
   let disposed = false
+  /** mux 断流重订阅定时器（仿 approval.ts）。 */
+  let retryTimer: NodeJS.Timeout | undefined
 
   /** 发卡片实体 + 引用发送，之后可用 card_id 全量更新。 */
   async function sendCardkit(chatId: string, card: object): Promise<{ messageId: string; cardId: string }> {
@@ -458,6 +462,16 @@ export function registerQuestions(runtime: QuestionRuntime): QuestionBridge {
     } catch (error) {
       if (!ac.signal.aborted) log('question mux stream ended:', errorMessage(error))
     }
+    // 流意外结束（非主动中止）：2s 退避后重新订阅（仿 approval.ts:388-394）。
+    // host 会以同 rpcId 重放仍 pending 的 question/requested 帧，发卡天然幂等
+    // （新 ask 发新卡，旧卡留在历史），不会重复消费。带停止标志防卸载后空转。
+    if (!ac.signal.aborted && !disposed) {
+      retryTimer = setTimeout(() => {
+        retryTimer = undefined
+        void consumeMux(api).catch((error) => log('question mux re-subscribe failed:', errorMessage(error)))
+      }, MUX_RETRY_MS)
+      retryTimer.unref()
+    }
   }
 
   /** 启动本体：apiProxy 就绪后注册 cardAction 监听 + reaper + mux 消费。 */
@@ -503,10 +517,12 @@ export function registerQuestions(runtime: QuestionRuntime): QuestionBridge {
       .catch((error) => log('questions: loader await failed:', errorMessage(error)))
   }
 
-  /** 卸载：停流、摘监听、停 reaper，并把仍在 pending 的 ask 全部 cancelled 提交回 host。 */
+  /** 卸载：停流、摘监听、停 reaper、清重订阅定时器，并把仍在 pending 的 ask 全部 cancelled 提交回 host。 */
   function dispose(): void {
     if (disposed) return
     disposed = true
+    if (retryTimer !== undefined) clearTimeout(retryTimer)
+    retryTimer = undefined
     ac.abort()
     for (const off of disposers.splice(0)) {
       try { off() } catch { /* already gone */ }
