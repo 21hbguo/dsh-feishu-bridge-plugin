@@ -4,7 +4,7 @@
 
 ![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)
 ![Platform](https://img.shields.io/badge/platform-DeepSeek%20Harness%20(DSH)-4B32C3)
-![Version](https://img.shields.io/badge/version-0.1.0-brightgreen)
+![Version](https://img.shields.io/badge/version-0.2.0-brightgreen)
 ![Language](https://img.shields.io/badge/language-TypeScript-3178C6)
 ![Messaging](https://img.shields.io/badge/feishu-lark-3370FF)
 
@@ -15,15 +15,20 @@ DSH（DeepSeek Harness）的进程内 Cordis 插件：飞书 IM 收发消息，�
 - 🚀 **飞书 IM ↔ DSH 对话桥**：基于 WebSocket 长连接收发消息，私聊即聊即答，群聊 @ 机器人触发。
 - 📬 **出站 Outbox 零丢失**：非流式回复与兜底错误通知先进持久化队列再投递（JSONL 分段 + 原子落盘、幂等键防重复），失败按有界指数退避重试，进程崩溃 / 重启后自动续投，at-least-once 不丢消息。
 - 📥 **入站 WAL 请求补发**：消息注入 Agent 前先落盘，回复确认送达后记账；进程崩溃 / 重启后启动对账，自动重新触发未送达的纯文本消息（单条最多补发 2 次、30 分钟窗口内），不再静默丢请求。
+- 🖼️ **入站多媒体**：图片消息自动下载 → 宿主 attachment 存储（ImageBlock）→ 注入 Agent 供视觉模型看图（宿主未装配 attachment 服务时降级为本地路径注记）；文件消息 → 下载 → 有界文本提取（150KB 字节界 + 8000 字符截断，txt/md/json/csv/log 等文本类）或二进制仅注记文件名 / 大小 / 路径；下载失败或 401/403 无凭据场景安静降级，绝不阻塞主流程；媒体消息不进 WAL 补发（重放不可靠，设计决策）；文件落盘 `~/.dsh/dsh-feishu-bridge/media/`。
+- 📤 **出站文件工具 `lark_send_local_file`**：模型主动把本地文件回传到当前飞书会话——会话反查（agent id → chat 映射）+ realpath 白名单（仅当前工作区与插件数据目录，防路径穿越）+ 20MB 上限 + 扩展名白名单（图片 / 文档 / 压缩包等常见格式）；png/jpg/webp/gif 发图片消息，其余发文件消息。
 - ⚡ **流式卡片**：DSH 输出逐字实时渲染到飞书卡片，思考过程「看得见」。
 - 📑 **Markdown 结构化卡片**：非流式回复自动识别 Markdown 结构（标题 / 列表 / 代码块 / 表格 / 分隔线 / 引用）渲染为结构化飞书卡片；超长（60 行 / 4000 字符）或解析异常自动降级为纯文本卡片；流式卡片保持逐字渲染不变。
 - 🔧 **工具调用进度**：agent 调用工具时卡片实时显示「🔧 正在调用工具：xxx…」，多步回合不再干等。
 - 🎯 **问答卡片**：agent 的 `ask_user_question` 以交互卡片呈现——按钮单选、勾选多选、聊天自由文本作答，点按即答。
 - 🛡️ **工具审批卡片**：agent 请求工具时推送「✅ 允许一次 / 🚫 拒绝」卡片，决策在飞书内完成；10 分钟未响应自动过期撤卡。
+- 🔐 **三级权限卡 `/permission`**：🔒 只读（沙箱只读）/ ✏️ 工作区写（工作区可写、工具需审批）/ ⚡ 全放行（同 `/yolo` 免审批）三档单选卡，点击即切；立即生效并持久化（state.json `chatPermissionTiers`），重启 / 新会话自动恢复，设置时同步覆盖 `/yolo` 内存态。
 - 😀 **表情回执**：收到消息随机打一个「已收到」表情，回合完成打 DONE ✅；仅使用飞书实测有效的表情全集（防 400 报错）；扫码一键配置自动申请 `im:message.reaction` 权限（旧应用需手动补开）。
 - ⚡ **扫码一键配置**：装好插件后发 `/setup`（飞书内）或调用 `feishu_setup` 工具（DSH 内），扫码即自动完成「创建应用 + 获取凭据 + 重连飞书」，免去手动开放平台配置。
 - 🧠 **思考强度调节**：`/effort` 查看当前模型支持的思考档位，`/effort <档位>` 切换，下一回合生效、偏好持久化。
-- ⌨️ **斜杠命令**：17 个命令覆盖模型切换、思考强度、工作区管理、会话恢复、流式开关、免审批模式、扫码配置等（见下方命令表）。
+- 🎛️ **命令卡片化**：`/model` 无参数升级为单选按钮卡——按供应商分组、点击即切（下一回合生效），原文本列表保留为 `/model list`，`/model <序号>` 直切不变。
+- 🏥 **一键诊断包 `/doctor`**：收集当前会话完整 session log（与 WebUI「Session log」下载同源，live 会话先 flush 落盘）+ 脱敏配置（凭据 / 密钥 / token 打码）+ ISSUE.md（插件与 DSH 版本 / 系统 / 状态快照 / 症状模板）→ fflate 打包 ZIP（日志 8MB 截断、ZIP 10MB 超限裁日志）→ 发回飞书；单项收集失败写入 ISSUE.md「收集失败」节，不阻塞出包。
+- ⌨️ **斜杠命令**：19 个命令覆盖模型切换、思考强度、工作区管理、会话恢复、流式开关、免审批模式、权限档位、诊断包、扫码配置等（见下方命令表）。
 - 🚦 **命令三级分流**：桥特有命令 → DSH 宿主注册命令（如 `/goal`，原生执行不走模型）→ 未知 `/xxx` 与普通消息原样注入 Agent，三级自动分流，命令与对话互不误伤。
 - 🔀 **每会话串行队列 + 插队**：同一聊天内消息按序处理；新消息可打断运行中的慢回合（阈值可配），也可强制排队。
 - 🐕 **看门狗**：单回合超过时限自动取消该回合并回复错误卡片，**绝不退出进程**。
@@ -88,9 +93,9 @@ flowchart LR
 
 | 模块 | 职责 |
 | --- | --- |
-| `src/index.ts` | 插件入口与核心运行时：消息入口、每 chat 串行队列与插队、看门狗、流式 / 非流式回复管线、Outbox / WAL / 配额熔断 / 表情回执接线、生命周期 |
+| `src/index.ts` | 插件入口与核心运行时：消息入口、每 chat 串行队列与插队、看门狗、流式 / 非流式回复管线、入站媒体分流与附件注入、Outbox / WAL / 配额熔断 / 表情回执接线、生命周期 |
 | `src/lark.ts` | 飞书 Channel：WebSocket 长连接、消息去重、聊天队列、陈旧消息窗口、流式卡片节流 |
-| `src/commands.ts` | 斜杠命令表与三级分流：Tier 1 桥命令 / Tier 2 宿主注册命令原生执行 / Tier 3 注入 Agent |
+| `src/commands.ts` | 斜杠命令表与三级分流（Tier 1 桥命令 / Tier 2 宿主注册命令原生执行 / Tier 3 注入 Agent）；P2 卡片化命令：/model 单选卡、/permission 三级权限卡、/doctor 接线与卡片回调路由 |
 | `src/outbox.ts` | 出站 Outbox：JSONL 分段 + 原子落盘、幂等键防重复投递、分航道 FIFO、有界指数退避、终态自清理、超长 payload 溢出 blobs/ |
 | `src/wal.ts` | 入站 WAL：注入前落盘、delivered 记账、启动对账补发（2 次 / 30 分钟窗口上限） |
 | `src/reactions.ts` | 表情回执：飞书实测 emoji 白名单过滤、随机「已收到」池、DONE 完成标记 |
@@ -99,7 +104,10 @@ flowchart LR
 | `src/approval.ts` | 工具审批卡片：订阅审批事件、发卡、按钮回调路由、过期回收、YOLO 自动放行 |
 | `src/questions.ts` | 问答卡片：单选 / 多选 / 自由文本、答案提交、过期回收、断流自动重订阅 |
 | `src/batching.ts` | 消息突发批处理：滑动窗口合并普通消息 |
-| `src/state.ts` | 状态持久化：会话代次 / 会话列表 / 工作区绑定 / 会话覆盖（原子落盘 0600） |
+| `src/media.ts` | 入站多媒体（P2）：图片下载 → attachment 存储（ImageBlock）/ 本地落盘，文件有界文本提取（150KB + 8000 字符）或元信息注记，401/403 安静降级 |
+| `src/send-file.ts` | 出站文件工具 `lark_send_local_file`（P2）：会话反查、realpath 白名单目录、20MB / 扩展名白名单、图片走 image 消息其余走 file 消息 |
+| `src/doctor.ts` | /doctor 诊断包（P2）：session log 收集（live 先 flush）+ 脱敏配置 + ISSUE.md，fflate ZIP 打包发送 |
+| `src/state.ts` | 状态持久化：会话代次 / 会话列表 / 工作区绑定 / 会话覆盖 / 权限档（chatPermissionTiers，原子落盘 0600） |
 | `src/text.ts` | 文本处理：@ 提及剥离、超长截断、token 数量格式化 |
 
 ## 🚀 快速开始
@@ -306,14 +314,16 @@ export FEISHU_APP_SECRET="xxxxxxxxxxxxxxxx"
 | `/reset` | — | 清空本会话记忆，开启新的 DSH 会话 |
 | `/new` | — | 同 `/reset`，开启新会话 |
 | `/workspace` | `[序号 \| 路径]` | 列出 / 切换工作区；`/workspace 0` 解除绑定（未分组，宿主默认 cwd）；`<路径>` 为已存在目录时自动创建并绑定；切换即开新会话（记忆清空） |
-| `/model` | `[序号]` | 列出可用模型，或 `/model <序号>` 切换（下一回合生效，记忆保留） |
+| `/model` | `list \| [序号]` | 无参数 = 单选按钮卡（按供应商分组，点击即切）；`/model list` = 文本列表；`/model <序号>` = 直接切换（下一回合生效，记忆保留） |
 | `/effort` | `[档位]` | 查看/切换思考强度：/effort 或 /effort <档位> |
 | `/stream` | `on \| off` | 本会话流式回复开关（无参查看当前状态） |
 | `/cancel` | — | 取消当前运行中的回合（回合卡住时自救） |
 | `/resume` | `[序号]` | 列出最近 10 个会话（带摘要）或 `/resume <序号>` 切换恢复记忆；支持恢复同一工作区内 web 端创建的会话，已归档自动隐藏 |
 | `/restart` | — | 重连飞书长连接（不退出进程） |
 | `/setup` | — | 扫码授权飞书应用（生成授权链接，打开后扫码即完成配置） |
-| `/yolo` | `[off]` | 本会话免审批模式：权限预设切换为 `danger-full-access`，工具调用自动放行；`/yolo off` 恢复 `workspace-write`。内存态，重启自动关闭 |
+| `/yolo` | `[off]` | 本会话免审批模式：权限预设切换为 `danger-full-access`，工具调用自动放行；`/yolo off` 恢复 `workspace-write`。内存态，重启自动关闭（`/permission` 的快捷方式，设置 `/permission` 时同步覆盖） |
+| `/permission` | `[read-only \| workspace-write \| full]` | 本会话权限三级切换：🔒 只读（沙箱只读）/ ✏️ 工作区写（工作区可写、工具需审批）/ ⚡ 全放行（同 `/yolo` 免审批）。无参数 = 三级单选卡，点击即切；立即生效并持久化（state.json），重启 / 新会话自动恢复 |
+| `/doctor` | — | 一键诊断包：当前会话完整 session log + 脱敏配置 + ISSUE.md，ZIP 发回本对话（约 10-30 秒） |
 | `/squeeze` | `<内容>` | 以「强制排队」模式处理内容（等待当前回合完成后处理） |
 | `/steer` | `<内容>` | 以「强制插队」模式处理内容（打断当前回合优先处理） |
 | `/ai` | `<内容>` | 显式把内容发给 AI（以 `/` 开头的内容会被当作命令，需要发送给 AI 时请使用它） |
@@ -324,8 +334,10 @@ export FEISHU_APP_SECRET="xxxxxxxxxxxxxxxx"
 
 - **凭据不硬编码**：App ID / App Secret 通过环境变量、插件 Config 或扫码一键配置写入的凭据文件注入（`~/.dsh/dsh-feishu-bridge/credentials.json`，权限 0600），仓库与源码中不含任何凭据；日志只记录机器人名称与消息摘要，不记录密钥。
 - **无遥测、无外部上报**：插件只在 DSH 进程内与飞书开放平台通信，不向任何第三方发送数据。
-- **运行时数据本地存储**：`open_id`、chat id、会话代次 / 工作区绑定 / 思考强度偏好等仅写入本地状态文件（`~/.dsh/dsh-feishu-bridge/state.json`），不发送到任何远端；出站投递队列（`outbox/`）、入站补发日志（`wal/`）与连接历史（`conn-history.jsonl`）同样仅落本地（权限 0600）。
-- **权限可控**：`/yolo` 免审批模式需用户显式开启，且为内存态——重启自动关闭，不会悄悄长驻高权限。
+- **运行时数据本地存储**：`open_id`、chat id、会话代次 / 工作区绑定 / 思考强度偏好 / 权限档等仅写入本地状态文件（`~/.dsh/dsh-feishu-bridge/state.json`），不发送到任何远端；出站投递队列（`outbox/`）、入站补发日志（`wal/`）、入站媒体文件（`media/`）与连接历史（`conn-history.jsonl`）同样仅落本地（权限 0600）。
+- **出站文件受白名单约束**：`lark_send_local_file` 仅允许发送当前聊天工作区与插件数据目录内的文件——realpath 校验（跟随符号链接，防 `..` 穿越）+ 20MB 上限 + 扩展名白名单（图片 / 文档 / 压缩包常见格式）；目录外、超限、非常规文件一律拒绝并回说明。
+- **/doctor 收集范围与脱敏**：诊断包只收集当前会话的 session log（与 WebUI「Session log」下载同源）与插件数据目录（`~/.dsh/dsh-feishu-bridge`）的配置，宿主配置文件不收集；凭据按敏感 key 名整体打码（App ID 保留前 7 位对照）、32 位以上长 token 正则打码。ZIP 以文件消息发回**当前对话**，请勿转发他人。
+- **权限可控**：`/yolo` 免审批模式需用户显式开启，且为内存态——重启自动关闭，不会悄悄长驻高权限；`/permission` 为持久化完整版（重启保持，设置时同步覆盖 `/yolo` 内存态），其中「⚡ 全放行」档与 `/yolo` 同语义，请按需使用。
 
 ## ❓ 常见问题
 
@@ -335,7 +347,7 @@ export FEISHU_APP_SECRET="xxxxxxxxxxxxxxxx"
 
 **Q2：状态文件在哪？删了会怎样？**
 
-状态文件位于 `~/.dsh/dsh-feishu-bridge/state.json`，保存每个聊天的会话代次、会话列表、工作区绑定与会话覆盖。删除后插件会以全新状态启动（各聊天从新会话开始）；历史会话的记忆内容由 DSH 的会话持久化管理，不受影响。
+状态文件位于 `~/.dsh/dsh-feishu-bridge/state.json`，保存每个聊天的会话代次、会话列表、工作区绑定、会话覆盖与权限档（`/permission` 设置，重启保持）。删除后插件会以全新状态启动（各聊天从新会话开始，权限回到默认「工作区写」）；历史会话的记忆内容由 DSH 的会话持久化管理，不受影响。
 
 **Q3：为什么源码构建需要 DSH checkout？**
 
