@@ -22,13 +22,25 @@
  *     接线为 processNormalText 后生效），未接线时保持原「未知命令」回复，
  *     保证现有行为零回归。
  * 两个注入点均为本模块级扩展，不改变 CommandRuntime / CommandRunner 契约。
+ *
+ * P2 卡片化命令（借鉴自 amlyczz/dsh-lark-link (MIT)）：
+ *   - /model 单选按钮卡（供应商分组）——src/presentation/cards.ts modelCard；
+ *   - /permission 三级权限卡（只读/工作区写/全放行，持久化 + 会话事件落地）
+ *     ——同文件 permissionCard 的档位列表 + command-router.ts 的 /permission
+ *     应用路径（permissionPresets 预设 / sandbox-mode 会话事件）；
+ *   - /doctor 诊断包 —— 实现在 src/doctor.ts（见其文件头）。
+ * 卡片回调订阅沿用 questions.ts / approval.ts 的独立订阅模式（channel.on
+ * 'cardAction' + value 前缀路由 cmd|model|… / cmd|perm|…，互不干扰），并
+ * 新增 commands.dispose() 供 index.ts teardown 卸载（可选接线）。
  */
 
-import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk'
+import type { CardActionEvent, LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk'
 import type { Context } from 'cordis'
+import { runDoctor } from './doctor.js'
 import { saveCredentials, setupErrorMessage, type SetupFlow } from './setup.js'
 import { firstSentence, formatTokens } from './text.js'
 import { currentEffort, installEffortPref, supportedEfforts } from './effort.js'
+import { loadState, savePermissionTier, type PermissionTier } from './state.js'
 import type {
   BridgeAgent,
   BridgeAgentRegistry,
@@ -37,6 +49,7 @@ import type {
   BridgeLogEvent,
   BridgeModelPreference,
   BridgePermissionPresetsService,
+  BridgeSession,
   BridgeSessionPersistence,
   BridgeSessionStore,
   BridgeTranscriptEntry,
@@ -437,12 +450,259 @@ export async function renderStatus(runtime: CommandRuntime, chatId: string): Pro
   return lines.join('\n')
 }
 
+// ---------------------------------------------------------------------------
+// P2 卡片化命令辅助：/permission 三级权限档 + /model 单选卡 + 回调路由
+// （权限档位与单选卡设计借鉴自 amlyczz/dsh-lark-link (MIT)
+//   src/presentation/cards.ts modelCard/permissionCard；卡片回调订阅模式同
+//   questions.ts / approval.ts：channel.on('cardAction') + value 前缀路由。）
+// ---------------------------------------------------------------------------
+
+/** /permission 卡片选项（三级：只读 / 工作区写 / 全放行）。 */
+const PERMISSION_TIERS: ReadonlyArray<{ id: PermissionTier; label: string; desc: string }> = [
+  { id: 'read-only', label: '🔒 只读', desc: '沙箱只读，写入操作被拒绝' },
+  { id: 'workspace-write', label: '✏️ 工作区写', desc: '仅工作区可写，工具调用需审批' },
+  { id: 'full', label: '⚡ 全放行', desc: '全访问 + 免审批（同 /yolo）' },
+]
+
+/** 权限档显示名。 */
+function tierLabel(tier: PermissionTier): string {
+  switch (tier) {
+    case 'read-only': return '只读'
+    case 'workspace-write': return '工作区写'
+    case 'full': return '全放行'
+  }
+}
+
+/** 命令输入 → 档位：接受 danger-full-access 作为 full 的别名；未知返回 undefined。 */
+function tierForInput(input: string): PermissionTier | undefined {
+  const v = input.trim().toLowerCase()
+  if (v === 'read-only') return 'read-only'
+  if (v === 'workspace-write') return 'workspace-write'
+  if (v === 'full' || v === 'danger-full-access') return 'full'
+  return undefined
+}
+
+/** 档位 → 宿主预设名（read-only 无默认预设，返回 undefined 走 sandbox 事件落地）。 */
+function presetNameForTier(tier: PermissionTier): string | undefined {
+  if (tier === 'workspace-write') return 'workspace-write'
+  if (tier === 'full') return 'danger-full-access'
+  return undefined
+}
+
+/** permissionPresets 服务的扩展面（local types.ts 只声明 set；current 用于展示当前档）。 */
+interface BridgePermissionPresetsExtended extends BridgePermissionPresetsService {
+  current?(events: readonly { type: string; data?: Record<string, unknown> }[]): string
+}
+
+/** 会话事件追加面（mirror of dsh-session Session.append；权限档经会话事件持久化、跨重启重放）。 */
+interface BridgeSessionAppendable extends BridgeSession {
+  append(type: string, data: Record<string, unknown>): void
+}
+
+/** 会话日志中最后一次某事件某字段的值（fold；对齐 effectiveSandboxMode/effectiveApprovalPolicy）。 */
+function lastEventField(events: readonly BridgeLogEvent[] | undefined, type: string, field: string): unknown {
+  const list = events ?? []
+  for (let i = list.length - 1; i >= 0; i--) {
+    const ev = list[i]
+    if (ev?.type !== type) continue
+    const data = ev.data as Record<string, unknown> | undefined
+    const v = data?.[field]
+    if (v !== undefined) return v
+  }
+  return undefined
+}
+
+/**
+ * 把权限档写入会话（事件层，跨重启经 session log 重放恢复）：优先走
+ * permissionPresets.set（有预设则写 permission/preset + sandbox/mode +
+ * approval/policy 事件）；read-only 宿主无默认预设（表只有 workspace-write /
+ * danger-full-access），部署若配置了 read-only 预设则用之，否则退化为
+ * sandbox/mode + approval/policy 两个会话事件直接落地（对齐
+ * setSandboxMode/setApprovalPolicy 的事件语义），幂等防重复追加。
+ */
+function applyPermissionEvents(runtime: CommandRuntime, session: BridgeSession, tier: PermissionTier): void {
+  const presets = runtime.ctx.get('permissionPresets') as BridgePermissionPresetsService | undefined
+  const preset = presetNameForTier(tier)
+  if (preset !== undefined) {
+    presets?.set(session, preset)
+    return
+  }
+  // read-only：先试部署可能配置的 read-only 预设，失败走事件落地。
+  if (presets !== undefined) {
+    try {
+      presets.set(session, 'read-only')
+      return
+    } catch { /* 部署未配置 read-only 预设 */ }
+  }
+  const appendable = session as BridgeSessionAppendable
+  if (lastEventField(session.events, 'sandbox/mode', 'mode') !== 'read-only') {
+    appendable.append('sandbox/mode', { mode: 'read-only' })
+  }
+  if (lastEventField(session.events, 'approval/policy', 'policy') !== 'ask') {
+    appendable.append('approval/policy', { policy: 'ask' })
+  }
+}
+
+/**
+ * 当前权限档：live 会话的宿主预设（current()）为准 → 持久化偏好
+ * （state.json chatPermissionTiers）→ 默认工作区写。
+ */
+function currentPermissionTier(runtime: CommandRuntime, chatId: string): PermissionTier {
+  const agent = runtime.getAgent(chatId)
+  if (agent !== undefined) {
+    try {
+      const presets = runtime.ctx.get('permissionPresets') as BridgePermissionPresetsExtended | undefined
+      const name = presets?.current?.(agent.session.events as { type: string; data?: Record<string, unknown> }[])
+      if (name === 'read-only') return 'read-only'
+      if (name === 'workspace-write') return 'workspace-write'
+      if (name === 'danger-full-access') return 'full'
+      // custom / 未知 → 看持久化偏好
+    } catch { /* current() 失败 → 看持久化 */ }
+  }
+  const persisted = loadState().chatPermissionTiers[chatId]
+  return persisted ?? 'workspace-write'
+}
+
+/**
+ * /permission 设置路径（命令与卡片回调共用）：live agent 上生效（顺序与
+ * /yolo 一致：先 approval.setPolicy 写实时旋钮 + 模型可见通知，再写会话
+ * 事件）+ 以 /permission 为准同步覆盖 /yolo 内存态 + 持久化 state.json。
+ * 返回回执文本。
+ */
+async function setPermissionTier(runtime: CommandRuntime, msg: NormalizedMessage, tier: PermissionTier): Promise<string> {
+  const agent = runtime.getAgent(msg.chatId)
+  const presets = runtime.ctx.get('permissionPresets') as BridgePermissionPresetsService | undefined
+  const approval = runtime.ctx.get('approval') as BridgeApprovalService | undefined
+  if (agent === undefined) {
+    return '⚠️ 会话尚未激活：先发一条消息让 DSH 会话就绪，再设置权限。'
+  }
+  if (approval === undefined) {
+    return '⚠️ 审批服务不可用（未装配 approval），无法切换。'
+  }
+  if (tier !== 'read-only' && presets === undefined) {
+    return '⚠️ 权限预设服务不可用（未装配 permissionPresets），无法切换。'
+  }
+  approval.setPolicy(agent, tier === 'full' ? 'never' : 'ask')
+  applyPermissionEvents(runtime, agent.session, tier)
+  // 以 /permission 为准：设置时同步覆盖 /yolo 内存态（full 即 yolo 语义）。
+  runtime.chatYoloPrefs.set(msg.chatId, tier === 'full')
+  savePermissionTier(msg.chatId, tier)
+  const desc = PERMISSION_TIERS.find((t) => t.id === tier)?.desc ?? ''
+  return `✅ 本会话权限已设为「${tierLabel(tier)}」（${desc}），立即生效并已持久化（重启保持）。`
+}
+
+/** /model 单选卡：按供应商分组，每模型一个按钮（借鉴自 lark-link modelCard）。 */
+function modelPickerCard(
+  current: BridgeModelPreference | undefined,
+  groups: Array<{ provider: string; label: string; models: ReadonlyArray<{ id: string; name: string }> }>,
+): object {
+  const elements: object[] = [
+    { tag: 'markdown', content: `**当前模型**：${current !== undefined ? `${current.provider}/${current.model}` : '未设置'}` },
+    { tag: 'markdown', content: '**按供应商选择模型**（点按钮即切换，下一回合生效，记忆保留）' },
+  ]
+  let first = true
+  for (const g of groups) {
+    if (g.models.length === 0) continue
+    if (!first) elements.push({ tag: 'hr' })
+    first = false
+    elements.push({ tag: 'markdown', content: `**${g.label}**` })
+    for (const m of g.models) {
+      elements.push({
+        tag: 'button',
+        width: 'fill',
+        text: { tag: 'plain_text', content: m.name !== '' ? m.name : m.id },
+        behaviors: [{ type: 'callback', value: { key: `cmd|model|${g.provider}|${m.id}` } }],
+      })
+    }
+  }
+  if (first) elements.push({ tag: 'markdown', content: '（无可用模型列表）' })
+  elements.push({ tag: 'markdown', content: '<font color=grey>/model list 查看文本列表；/model <序号> 直接切换。</font>' })
+  return { schema: '2.0', header: { title: { tag: 'plain_text', content: '切换模型' }, template: 'blue' }, body: { elements } }
+}
+
+/** /permission 三级权限卡（档位列表 + 每档一个按钮）。 */
+function permissionPickerCard(current: PermissionTier): object {
+  const elements: object[] = [
+    { tag: 'markdown', content: `**权限模式**（当前：${tierLabel(current)}）` },
+    { tag: 'markdown', content: '点按钮即切换：立即生效并持久化（重启保持）；/yolo 是内存态快捷方式，以 /permission 为准。' },
+  ]
+  for (const t of PERMISSION_TIERS) {
+    elements.push({ tag: 'markdown', content: `${t.label} — ${t.desc}${t.id === current ? '（当前）' : ''}` })
+    elements.push({
+      tag: 'button',
+      width: 'fill',
+      text: { tag: 'plain_text', content: t.label },
+      behaviors: [{ type: 'callback', value: { key: `cmd|perm|${t.id}` } }],
+    })
+  }
+  return { schema: '2.0', header: { title: { tag: 'plain_text', content: '切换权限' }, template: 'orange' }, body: { elements } }
+}
+
+/** CardActionEvent → NormalizedMessage 最小适配（cmdReply 只读 messageId/chatId）。 */
+function cardActionAsMessage(evt: CardActionEvent): NormalizedMessage {
+  return { messageId: evt.messageId, chatId: evt.chatId } as NormalizedMessage
+}
+
+/**
+ * 命令卡回调路由（P2）：`cmd|model|<provider>|<model>` 与 `cmd|perm|<tier>`。
+ * 与 questions.ts / approval.ts 各自独立订阅（互不干扰）；非 cmd| 前缀直接
+ * 返回，不碰他人卡片。
+ */
+async function onCommandCardAction(runtime: CommandRuntime, evt: CardActionEvent): Promise<void> {
+  try {
+    const value = evt?.action?.value
+    if (typeof value !== 'object' || value === null) return
+    const key = (value as { key?: unknown }).key
+    if (typeof key !== 'string') return
+    const parts = key.split('|')
+    if (parts[0] !== 'cmd') return
+    const msg = cardActionAsMessage(evt)
+    if (parts[1] === 'model') {
+      const provider = parts[2] ?? ''
+      const model = parts.slice(3).join('|')
+      if (provider === '' || model === '') return
+      const pref: BridgeModelPreference = { provider, model }
+      runtime.chatModelPrefs.set(msg.chatId, pref)
+      applyModelToLiveAgent(runtime, msg.chatId, pref)
+      await runtime.cmdReply(msg, `✅ 已切换模型：${model}（${provider}），下一回合生效（记忆保留）。`)
+    } else if (parts[1] === 'perm') {
+      const tier = tierForInput(parts[2] ?? '')
+      if (tier === undefined) return
+      await runtime.cmdReply(msg, await setPermissionTier(runtime, msg, tier))
+    }
+  } catch (error) {
+    runtime.log('command cardAction handling failed:', errorMessage(error))
+  }
+}
+
+/**
+ * 会话创建时恢复持久化权限档（P2 /permission 的「重启恢复」补充：feishu chat
+ * 的新会话——含 /reset 后——按 state.json 中该 chat 的档位写入会话事件，宿主
+ * 重放后生效；幂等——档位未变时 presets.set / 事件守卫不重复追加）。
+ */
+function onSessionCreated(runtime: CommandRuntime, session: BridgeSession): void {
+  try {
+    const id = session.id
+    if (typeof id !== 'string' || !id.startsWith('feishu-')) return
+    const tiers = loadState().chatPermissionTiers
+    for (const [chatId, tier] of Object.entries(tiers)) {
+      if (runtime.sessionIdForChat(chatId) === id) {
+        applyPermissionEvents(runtime, session, tier)
+        runtime.log(`permission tier restored on session/created: ${id} → ${tier}`)
+        return
+      }
+    }
+  } catch (error) {
+    runtime.log('permission restore on session/created failed:', errorMessage(error))
+  }
+}
+
 /**
  * Register the slash-command table against the bridge runtime and return the
  * dispatcher handle() uses. Command state mutations (epochs, workspace
  * binding, model preference) go through the runtime maps and persist().
  */
-export function registerCommands(runtime: CommandRuntime): CommandRunner {
+export function registerCommands(runtime: CommandRuntime): CommandRunner & { dispose(): void } {
   const cmdReply = runtime.cmdReply
 
   const COMMANDS: Record<string, Command> = {
@@ -563,18 +823,20 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
       },
     },
     model: {
-      desc: '列出/切换模型：/model 或 /model <序号>',
+      desc: '切换模型：/model（单选卡）| /model list（文本列表）| /model <序号>',
       async run(msg, arg) {
         const llm = runtime.ctx.get('llm') as BridgeLlm | undefined
         if (llm === undefined) {
           await cmdReply(msg, '⚠️ 模型服务不可用（未装配 llm）。')
           return
         }
-        const entries: Array<{ provider: string; providerName: string; model: string }> = []
+        const entries: Array<{ provider: string; providerName: string; model: string; name: string }> = []
         try {
           for (const provider of llm.listProviders()) {
             const models = await llm.listModels(provider.id)
-            for (const model of models) entries.push({ provider: provider.id, providerName: provider.name, model: model.id })
+            for (const model of models) {
+              entries.push({ provider: provider.id, providerName: provider.name, model: model.id, name: model.name !== '' ? model.name : model.id })
+            }
           }
         } catch (error) {
           await cmdReply(msg, `⚠️ ${errorMessage(error).slice(0, 150)}`)
@@ -583,16 +845,33 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
         const current = currentModel(runtime, msg.chatId)
         const n = Number.parseInt(arg, 10)
         if (arg.trim() === '' || Number.isNaN(n)) {
-          if (entries.length === 0) { await cmdReply(msg, '没有可用模型。'); return }
-          const lines = entries.map((e, i) => {
-            const isCur = current !== undefined && e.provider === current.provider && e.model === current.model
-            return `${i + 1}. ${e.model}（${e.providerName ?? e.provider}）${isCur ? ' ← 当前' : ''}`
-          })
-          if (current !== undefined && !entries.some((e) => e.provider === current.provider && e.model === current.model)) {
-            lines.push(`（当前不在列表中：${current.provider} / ${current.model}）`)
+          if (arg.trim() === 'list') {
+            // P2 决策：原纯文本列表保留为 /model list（最小侵入——no-arg 行为
+            // 升级为单选卡，文本形态仍然可用）。
+            if (entries.length === 0) { await cmdReply(msg, '没有可用模型。'); return }
+            const lines = entries.map((e, i) => {
+              const isCur = current !== undefined && e.provider === current.provider && e.model === current.model
+              return `${i + 1}. ${e.model}（${e.providerName ?? e.provider}）${isCur ? ' ← 当前' : ''}`
+            })
+            if (current !== undefined && !entries.some((e) => e.provider === current.provider && e.model === current.model)) {
+              lines.push(`（当前不在列表中：${current.provider} / ${current.model}）`)
+            }
+            lines.push('输入 /model <序号> 切换（下一回合生效，记忆保留）。')
+            await cmdReply(msg, lines.join('\n'))
+            return
           }
-          lines.push('输入 /model <序号> 切换（下一回合生效，记忆保留）。')
-          await cmdReply(msg, lines.join('\n'))
+          // P2：no-arg 输出单选按钮卡（按供应商分组，点按钮即切换）。
+          if (entries.length === 0) { await cmdReply(msg, '没有可用模型。'); return }
+          const groups: Array<{ provider: string; label: string; models: Array<{ id: string; name: string }> }> = []
+          for (const e of entries) {
+            let g = groups.find((it) => it.provider === e.provider)
+            if (g === undefined) {
+              g = { provider: e.provider, label: e.providerName !== '' ? e.providerName : e.provider, models: [] }
+              groups.push(g)
+            }
+            g.models.push({ id: e.model, name: e.name })
+          }
+          await runtime.channel.send(msg.chatId, { card: modelPickerCard(current, groups) }, {})
           return
         }
         const entry = entries[n - 1]
@@ -795,6 +1074,47 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
         await cmdReply(msg, '⚡ YOLO 已开启：本会话权限预设 → danger-full-access（免审批直接执行）。/yolo off 恢复。')
       },
     },
+    permission: {
+      desc: '设置本会话权限：/permission（三级卡片）| /permission <read-only|workspace-write|full>',
+      async run(msg, arg) {
+        if (arg.trim() === '') {
+          // 卡片：三级单选（只读 / 工作区写 / 全放行），点按钮即切换。
+          await runtime.channel.send(msg.chatId, { card: permissionPickerCard(currentPermissionTier(runtime, msg.chatId)) }, {})
+          return
+        }
+        const tier = tierForInput(arg)
+        if (tier === undefined) {
+          await cmdReply(msg, `⚠️ 未知权限档「${arg.trim()}」（可用：read-only / workspace-write / full）。`)
+          return
+        }
+        await cmdReply(msg, await setPermissionTier(runtime, msg, tier))
+      },
+    },
+    doctor: {
+      desc: '生成诊断包（会话日志+脱敏配置+ISSUE.md，ZIP 发回本对话）',
+      async run(msg) {
+        await cmdReply(msg, '🏥 正在生成诊断包（会话日志 + 脱敏配置 + ISSUE.md），请稍候…')
+        // 生成与发送异步完成，不阻塞命令队列；任一环节失败回文本错误卡片。
+        void runDoctor({
+          ctx: runtime.ctx,
+          channel: runtime.channel,
+          chatId: msg.chatId,
+          sessionId: runtime.sessionIdForChat(msg.chatId),
+          appId: runtime.appId,
+          statusText: () => renderStatus(runtime, msg.chatId),
+          extraConfig: {
+            streamDefault: runtime.streamDefault,
+            botName: runtime.channel.botIdentity?.name ?? '',
+          },
+          log: runtime.log,
+        }).then(async (summary) => {
+          await cmdReply(msg, summary)
+        }).catch(async (error) => {
+          runtime.log('doctor failed:', errorMessage(error))
+          await cmdReply(msg, `⚠️ 诊断包生成失败：${errorMessage(error).slice(0, 300)}`)
+        })
+      },
+    },
   }
 
   /**
@@ -860,5 +1180,27 @@ export function registerCommands(runtime: CommandRuntime): CommandRunner {
     await cmdReply(msg, `未知命令 /${cmdName}。输入 /help 查看可用命令；想把内容发给 AI，用 /ai <内容>。`)
   }
 
-  return { runCommand }
+  // ---- P2 命令卡回调与权限恢复接线 ------------------------------------------
+  // 与 questions.ts / approval.ts 各自独立订阅（channel.on('cardAction') +
+  // ctx.on('session/created')），互不干扰；返回的 dispose 供 index.ts
+  // teardown 卸载（可选接线，见完成上报「index.ts 接线需求清单」）。
+  const disposers: Array<() => void> = []
+  disposers.push(runtime.channel.on('cardAction', (evt) => {
+    void onCommandCardAction(runtime, evt).catch((error) => runtime.log('command cardAction failed:', errorMessage(error)))
+  }))
+  try {
+    disposers.push(runtime.ctx.on('session/created', (session) => onSessionCreated(runtime, session as BridgeSession)))
+  } catch (error) {
+    runtime.log('session/created subscription unavailable:', errorMessage(error))
+  }
+
+  return {
+    runCommand,
+    /** 卸载命令卡回调与 session/created 恢复监听（index.ts teardown 可选调用）。 */
+    dispose(): void {
+      for (const off of disposers.splice(0)) {
+        try { off() } catch { /* already gone */ }
+      }
+    },
+  }
 }
