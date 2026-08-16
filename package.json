@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-feishu-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "飞书机器人 ↔ DSH 对话桥：进程内驱动 DSH 会话，流式卡片回复",
   "type": "module",
   "main": "./lib/index.js",
@@ -48,6 +48,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.73.0"
+    "@larksuiteoapi/node-sdk": "^1.73.0",
+    "fflate": "^0.8.3"
   }
 }
