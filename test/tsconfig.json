@@ -1,0 +1,12 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationDir": null,
+    "outDir": null,
+    "rootDir": "..",
+    "types": ["node"]
+  },
+  "include": ["helpers.ts", "unit"]
+}
