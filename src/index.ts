@@ -22,9 +22,12 @@ import { createOutbox } from './outbox.js'
 import { createWal, type WalRecord } from './wal.js'
 import { createBatcher } from './batching.js'
 import { registerApproval } from './approval.js'
-import { registerCommands, renderStatus, type CommandRuntime } from './commands.js'
+import { registerCommands, renderStatus, setAgentFallback, setCommandsHost, setStatusExtra, type BridgeCommandsHost, type CommandRuntime } from './commands.js'
 import { installEffortPref } from './effort.js'
+import { renderReply } from './markdown-card.js'
 import { registerQuestions } from './questions.js'
+import { createQuotaGovernor } from './quota.js'
+import { doneReaction, pickReaction } from './reactions.js'
 import { buildChannel } from './lark.js'
 import { beginSetupFlow, loadCredentials, saveCredentials, setupErrorMessage, type SetupFlow } from './setup.js'
 import { loadState, saveState, sessionIdFor, type BridgeState } from './state.js'
@@ -114,6 +117,16 @@ export function apply(ctx: Context, config: Config): void {
   if (appId === '' || appSecret === '') {
     throw new Error(`${name}: FEISHU_APP_ID / FEISHU_APP_SECRET are required (Config or environment)`)
   }
+
+  // P1 命令三级分流 Tier 2 接线：宿主 commands 服务（@deepseek-ai/dsh-commands）
+  // 未装配时取不到即为 undefined，Tier 2 自动禁用（未知 /xxx 走 Tier 3）。
+  let commandsHost: BridgeCommandsHost | undefined
+  try {
+    commandsHost = ctx.get('commands') as BridgeCommandsHost | undefined
+  } catch {
+    commandsHost = undefined
+  }
+  setCommandsHost(commandsHost)
 
   // One effect owns the whole bridge lifetime: the current bridge generation
   // (channel + runtime + channel listeners), the global session/event feed,
@@ -296,6 +309,11 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   })
   outbox.rebuildFromDisk() // sending → pending：崩溃/重载/凭据重建后恢复投递
   outbox.start()
+
+  // P1 连接配额熔断：60min 窗口内失败 ≥12 次即熔断（conn-history.jsonl 0600
+  // 落盘、跨重启生效），防止病态重连循环烧光飞书连接配额（错误码 1000040350）。
+  // 与 setup.ts 的 credentials.json 同目录（~/.dsh/dsh-feishu-bridge/）。
+  const quota = createQuotaGovernor(join(homedir(), '.dsh', 'dsh-feishu-bridge', 'conn-history.jsonl'))
 
   function log(...args: unknown[]): void {
     console.error(`[${name} ${new Date().toISOString().slice(11, 19)}]`, ...args)
@@ -631,13 +649,29 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
     return null
   }
 
-  /** Build the reply card JSON: markdown body + optional interrupt note + token footer. */
+  /**
+   * Build the reply card JSON: markdown body + optional interrupt note + token footer.
+   * @param opts.structured - 非流式一次性卡片路径：P1 Markdown 结构化渲染
+   * （renderReply 拆出标题/列表/代码块/表格元素）；缺省（流式 patch 路径
+   * appendTokenFooter）保持单一 markdown 元素不动，流式卡片零改动。
+   */
   function replyCard(
     body: string,
     interrupted: boolean,
     usage: { billed: number; output: number } | null,
+    opts: { structured?: boolean } = {},
   ): object {
-    const elements: object[] = [{ tag: 'markdown', element_id: 'stream_md', content: body }]
+    let degraded = false
+    let mdElements: object[]
+    if (opts.structured) {
+      const rendered = renderReply(body)
+      degraded = rendered.degraded
+      mdElements = rendered.elements
+    } else {
+      mdElements = [{ tag: 'markdown', element_id: 'stream_md', content: body }]
+    }
+    if (degraded) log('reply card fell back to plain markdown (too long / parse fallback)')
+    const elements: object[] = [...mdElements]
     if (interrupted) {
       elements.push({
         tag: 'div',
@@ -710,6 +744,8 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
       // Completed turn: patch interrupt note + token footer onto the card.
       if (streamed.trim() !== '') {
         await appendTokenFooter(msg.chatId, messageId, streamed, interrupted)
+        // P1 完成回执：有输出且未被插队打断、未被审批阻塞 → 打 DONE ✅。
+        if (!interrupted && !blocked) sendReaction(msg, doneReaction())
       }
     } catch (error) {
       if (error instanceof TurnTimeoutError) throw error
@@ -750,6 +786,17 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
 
   async function cmdReply(msg: NormalizedMessage, text: string): Promise<void> {
     await channel.send(msg.chatId, { text }, { replyTo: msg.messageId })
+  }
+
+  /**
+   * P1 表情回执发送：fire-and-forget，失败仅 log 绝不抛（缺 im:message.reaction
+   * scope / 消息过期等场景静默降级，不影响主流程）。emoji 为 undefined 不发。
+   */
+  function sendReaction(msg: NormalizedMessage, emoji: string | undefined): void {
+    if (emoji === undefined) return
+    void channel.addReaction(msg.messageId, emoji).catch((error) => {
+      log(`reaction ${emoji} failed (skipped):`, errorMessage(error))
+    })
   }
 
   /**
@@ -881,10 +928,13 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
           ? `${truncate(answer, config.maxReplyChars)}\n\n⚠️ 该请求需要交互，请在 Web GUI 处理。`
           : truncate(answer, config.maxReplyChars)
         const id = enqueueDurable({
-          chatId: msg.chatId, kind: 'card', card: replyCard(body, result.interrupted, usage),
+          // P1：非流式卡片走 Markdown 结构化渲染（标题/列表/代码块/表格元素）。
+          chatId: msg.chatId, kind: 'card', card: replyCard(body, result.interrupted, usage, { structured: true }),
           replyTo: msg.messageId, dedupeKey: `reply:${msg.messageId}`, sourceMessageId: msg.messageId,
         })
         if (id === undefined) markDelivered(msg.messageId)
+        // P1 完成回执：回合成功收尾（有输出、未打断、未阻塞）→ 打 DONE ✅。
+        if (!result.interrupted && !result.blocked) sendReaction(msg, doneReaction())
       }
     } catch (error) {
       if (error instanceof TurnTimeoutError) { await handleTimeout(msg); return }
@@ -981,10 +1031,13 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
       return
     }
 
+    // P1 表情回执：收到用户消息打随机表情（仅非批处理合并路径——直接注入的
+    // 消息；批处理窗口内的消息不打，等 flush 后由完成回执覆盖）。失败仅 log。
     // Batch window: only plain messages (no forced mode, no /ai) enter the
     // per-chat burst window; commands and forced modes bypass it. A pending
     // window is untouched by a command and still flushes on its own timer.
     if (!batched || batcher === undefined) {
+      sendReaction(msg, pickReaction())
       await processNormalText(msg, text, forced)
       return
     }
@@ -1162,6 +1215,15 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
   }
   const runCommand = registerCommands(commandRuntime).runCommand
 
+  // P1 命令三级分流接线（Tier 2 的 setCommandsHost 已在 apply() 完成）：
+  // Tier 3 未命中命令回流 agent 注入管线（processNormalText）——保持 /ai /goal
+  // 语义：/goal 等宿主注册命令经 Tier 2 原生执行，其余未知 /xxx 注入 agent。
+  setAgentFallback((msg, text) => processNormalText(msg, text, undefined))
+  // /status 附加行（可选加分）：连接配额熔断状态。
+  setStatusExtra(() => quota.tripped()
+    ? `⛔ 连接配额已熔断（60min 窗口失败达上限，${new Date(quota.resetAt() ?? Date.now()).toLocaleString('zh-CN')} 后可自动重试）`
+    : `🔌 连接配额剩余 ${quota.remaining()} 次`)
+
   // ------------------------------------------------------------ questions (see src/questions.ts)
   /** Reverse-map a DSH session id back to the Feishu chat that owns it. */
   function chatIdForSession(sessionId: string): string | undefined {
@@ -1238,8 +1300,15 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
 
   /** Connect the channel; on initial handshake failure, retry with backoff. */
   async function connectChannel(): Promise<void> {
+    // P1 配额熔断：窗口内失败达上限时不再自动重试（跳过 30s 定时器），等窗口
+    // 滑动后用户 /restart（reset + 重连）或下次自然触发。
+    if (quota.tripped()) {
+      log(`连接配额熔断（${quota.remaining()} 次额度），等待窗口重置；/restart 可手动解除`)
+      return
+    }
     try {
       await channel.connect()
+      quota.recordConnect(true)
       log(`channel connected: bot=${channel.botIdentity?.openId} (${channel.botIdentity?.name})`)
       if (!firstConnectDone) {
         firstConnectDone = true
@@ -1249,12 +1318,18 @@ function createRuntime(ctx: Context, channel: LarkChannel, config: Config, appId
       }
     } catch (error) {
       log('channel connect failed (will retry):', errorMessage(error))
-      scheduleConnectRetry()
+      quota.recordConnect(false)
+      if (quota.tripped()) {
+        log(`连接配额熔断：60min 窗口内失败已达阈值，停止自动重试（窗口 ${new Date(quota.resetAt() ?? Date.now()).toISOString()} 后解除）`)
+      } else {
+        scheduleConnectRetry()
+      }
     }
   }
 
   /** /restart semantics: reconnect the channel — the process stays alive. */
   async function restartChannel(): Promise<void> {
+    quota.reset() // 用户显式意图（/restart）：解除熔断并清空连接历史
     try { await channel.disconnect() } catch { /* already gone */ }
     await connectChannel()
   }
