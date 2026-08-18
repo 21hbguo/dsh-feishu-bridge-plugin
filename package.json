@@ -8,7 +8,7 @@
   "files": [
     "lib"
   ],
-  "license": "BSD-3-Clause",
+  "license": "MIT",
   "keywords": [
     "dsh",
     "deepseek-harness",
